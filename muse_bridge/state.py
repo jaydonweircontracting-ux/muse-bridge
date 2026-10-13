@@ -1,12 +1,7 @@
-"""Response-state tracker for Muse Bridge.
+"""Explicit handoff states for Muse Bridge (free existing-window edition).
 
-The core safety requirement: the bot must NEVER assume a response is
-complete merely because the screen stopped changing, must never send a
-second prompt while the previous task is running, and must never treat
-an incomplete response as final.
-
-States mirror the project spec. Every transition is logged with a
-timestamp. Timeouts and retries are bounded.
+The bot NEVER guesses: every state transition is explicit, logged, and
+persisted. A response is only "received" when the user transfers it.
 """
 
 from __future__ import annotations
@@ -14,136 +9,102 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable, Optional
+from typing import Callable
 
 
-class ResponseState(str, Enum):
-    READY = "READY"
-    TASK_SENT = "TASK_SENT"
-    WAITING_FOR_RESPONSE = "WAITING_FOR_RESPONSE"
-    RESPONSE_IN_PROGRESS = "RESPONSE_IN_PROGRESS"
-    RESPONSE_COMPLETE = "RESPONSE_COMPLETE"
-    REVIEWING = "REVIEWING"
-    SENDING_TO_MUSE = "SENDING_TO_MUSE"
-    MUSE_WORKING = "MUSE_WORKING"
-    VERIFYING = "VERIFYING"
-    CHECKPOINTING = "CHECKPOINTING"
+class HandoffState(str, Enum):
+    READY = "READY"                    # idle, nothing in flight
+    PREPARED = "PREPARED"              # prompt prepared & copied, not yet handed off
+    WAITING_FOR_USER = "WAITING_FOR_USER"  # user pasting into ChatGPT/Muse
+    MUSE_RUNNING = "MUSE_RUNNING"      # task with Muse, awaiting completion
+    AWAITING_REPORT = "AWAITING_REPORT"    # Muse done (user-confirmed), report not yet transferred
+    REVIEW_PENDING = "REVIEW_PENDING"  # review prompt prepared, awaiting ChatGPT review
+    TASK_PASSED = "TASK_PASSED"        # review approved, checkpoint saved
+    TASK_FAILED = "TASK_FAILED"        # review rejected / error
     PAUSED = "PAUSED"
     BLOCKED = "BLOCKED"
-    ERROR = "ERROR"
     STOPPED = "STOPPED"
 
 
-# Legal transitions. Anything not listed here is rejected and logged.
-_ALLOWED: dict[ResponseState, set[ResponseState]] = {
-    ResponseState.READY: {
-        ResponseState.TASK_SENT, ResponseState.PAUSED,
-        ResponseState.STOPPED, ResponseState.BLOCKED,
-    },
-    ResponseState.TASK_SENT: {
-        ResponseState.WAITING_FOR_RESPONSE, ResponseState.ERROR,
-        ResponseState.PAUSED, ResponseState.STOPPED,
-    },
-    ResponseState.WAITING_FOR_RESPONSE: {
-        ResponseState.RESPONSE_IN_PROGRESS, ResponseState.ERROR,
-        ResponseState.PAUSED, ResponseState.STOPPED,
-    },
-    ResponseState.RESPONSE_IN_PROGRESS: {
-        ResponseState.RESPONSE_COMPLETE, ResponseState.ERROR,
-        ResponseState.PAUSED, ResponseState.STOPPED,
-    },
-    ResponseState.RESPONSE_COMPLETE: {
-        ResponseState.REVIEWING, ResponseState.ERROR,
-        ResponseState.PAUSED, ResponseState.STOPPED,
-    },
-    ResponseState.REVIEWING: {
-        ResponseState.SENDING_TO_MUSE, ResponseState.READY,
-        ResponseState.BLOCKED, ResponseState.ERROR,
-        ResponseState.PAUSED, ResponseState.STOPPED,
-    },
-    ResponseState.SENDING_TO_MUSE: {
-        ResponseState.MUSE_WORKING, ResponseState.ERROR,
-        ResponseState.PAUSED, ResponseState.STOPPED,
-    },
-    ResponseState.MUSE_WORKING: {
-        ResponseState.VERIFYING, ResponseState.ERROR,
-        ResponseState.PAUSED, ResponseState.STOPPED,
-    },
-    ResponseState.VERIFYING: {
-        ResponseState.CHECKPOINTING, ResponseState.READY,
-        ResponseState.BLOCKED, ResponseState.ERROR,
-        ResponseState.PAUSED, ResponseState.STOPPED,
-    },
-    ResponseState.CHECKPOINTING: {
-        ResponseState.READY, ResponseState.ERROR,
-        ResponseState.PAUSED, ResponseState.STOPPED,
-    },
-    ResponseState.PAUSED: {
-        ResponseState.READY, ResponseState.STOPPED,
-    },
-    ResponseState.BLOCKED: {
-        ResponseState.READY, ResponseState.STOPPED,
-    },
-    ResponseState.ERROR: {
-        ResponseState.READY, ResponseState.PAUSED, ResponseState.STOPPED,
-    },
-    ResponseState.STOPPED: {
-        ResponseState.READY,
-    },
+# Legal transitions. Anything else is rejected and logged.
+LEGAL: dict[HandoffState, set[HandoffState]] = {
+    HandoffState.READY: {HandoffState.PREPARED, HandoffState.PAUSED,
+                         HandoffState.STOPPED, HandoffState.BLOCKED},
+    HandoffState.PREPARED: {HandoffState.WAITING_FOR_USER,
+                            HandoffState.READY,   # reprepare / cancel
+                            HandoffState.PAUSED, HandoffState.STOPPED},
+    HandoffState.WAITING_FOR_USER: {HandoffState.MUSE_RUNNING,
+                                    HandoffState.REVIEW_PENDING,
+                                    HandoffState.READY, HandoffState.PAUSED,
+                                    HandoffState.STOPPED, HandoffState.BLOCKED},
+    HandoffState.MUSE_RUNNING: {HandoffState.AWAITING_REPORT,
+                                HandoffState.PAUSED, HandoffState.STOPPED,
+                                HandoffState.BLOCKED},
+    HandoffState.AWAITING_REPORT: {HandoffState.REVIEW_PENDING,
+                                   HandoffState.PAUSED, HandoffState.STOPPED},
+    HandoffState.REVIEW_PENDING: {HandoffState.TASK_PASSED,
+                                  HandoffState.TASK_FAILED,
+                                  HandoffState.PREPARED,  # correction task
+                                  HandoffState.PAUSED, HandoffState.STOPPED,
+                                  HandoffState.BLOCKED},
+    HandoffState.TASK_PASSED: {HandoffState.PREPARED, HandoffState.READY,
+                               HandoffState.PAUSED, HandoffState.STOPPED},
+    HandoffState.TASK_FAILED: {HandoffState.PREPARED, HandoffState.READY,
+                               HandoffState.PAUSED, HandoffState.STOPPED,
+                               HandoffState.BLOCKED},
+    HandoffState.PAUSED: {HandoffState.READY, HandoffState.STOPPED},
+    HandoffState.BLOCKED: {HandoffState.READY, HandoffState.STOPPED},
+    HandoffState.STOPPED: {HandoffState.READY},
+}
+
+# States where a handoff is "in flight": starting another is forbidden.
+IN_FLIGHT = {
+    HandoffState.PREPARED, HandoffState.WAITING_FOR_USER,
+    HandoffState.MUSE_RUNNING, HandoffState.AWAITING_REPORT,
+    HandoffState.REVIEW_PENDING,
 }
 
 
 @dataclass
 class Transition:
+    at: float
     from_state: str
     to_state: str
-    at: float
     reason: str = ""
 
 
 @dataclass
 class StateTracker:
-    """Tracks one task's lifecycle through the response states."""
-
-    state: ResponseState = ResponseState.READY
-    state_entered_at: float = field(default_factory=time.time)
+    state: HandoffState = HandoffState.READY
     history: list[Transition] = field(default_factory=list)
-    # Configurable safety bounds
-    response_timeout_s: float = 600.0
     max_retries: int = 3
     retries_used: int = 0
-    on_change: Optional[Callable[[Transition], None]] = None
+    on_change: Callable[[Transition], None] | None = None
 
-    def transition(self, new_state: ResponseState, reason: str = "") -> bool:
-        """Attempt a transition. Returns False (and logs) if illegal."""
-        allowed = _ALLOWED.get(self.state, set())
-        now = time.time()
-        if new_state not in allowed:
-            tr = Transition(self.state.value, new_state.value, now,
-                            f"REJECTED illegal transition: {reason}")
+    def can(self, to: HandoffState) -> bool:
+        return to in LEGAL.get(self.state, set())
+
+    def transition(self, to: HandoffState, reason: str = "") -> bool:
+        if not self.can(to):
+            tr = Transition(time.time(), self.state.value, to.value,
+                            f"REJECTED illegal: {reason}")
             self.history.append(tr)
             if self.on_change:
                 self.on_change(tr)
             return False
-        tr = Transition(self.state.value, new_state.value, now, reason)
+        tr = Transition(time.time(), self.state.value, to.value, reason)
         self.history.append(tr)
-        self.state = new_state
-        self.state_entered_at = now
-        if new_state == ResponseState.TASK_SENT:
+        self.state = to
+        if to in (HandoffState.TASK_PASSED, HandoffState.TASK_FAILED,
+                  HandoffState.READY):
             self.retries_used = 0
         if self.on_change:
             self.on_change(tr)
         return True
 
-    def time_in_state(self) -> float:
-        return time.time() - self.state_entered_at
-
-    def is_timed_out(self) -> bool:
-        return self.state in (
-            ResponseState.WAITING_FOR_RESPONSE,
-            ResponseState.RESPONSE_IN_PROGRESS,
-            ResponseState.MUSE_WORKING,
-        ) and self.time_in_state() > self.response_timeout_s
+    def busy(self) -> bool:
+        """True while a handoff is in flight — never start a second one."""
+        return self.state in IN_FLIGHT
 
     def can_retry(self) -> bool:
         return self.retries_used < self.max_retries
@@ -151,10 +112,24 @@ class StateTracker:
     def note_retry(self) -> None:
         self.retries_used += 1
 
-    def busy(self) -> bool:
-        """True while a task is in flight — new tasks must NOT start."""
-        return self.state not in (
-            ResponseState.READY, ResponseState.PAUSED,
-            ResponseState.BLOCKED, ResponseState.ERROR,
-            ResponseState.STOPPED,
-        )
+    def save(self) -> dict:
+        return {
+            "state": self.state.value,
+            "retries_used": self.retries_used,
+            "history": [vars(t) for t in self.history[-50:]],
+        }
+
+    @classmethod
+    def load(cls, data: dict) -> "StateTracker":
+        t = cls()
+        try:
+            t.state = HandoffState(data.get("state", "READY"))
+        except ValueError:
+            t.state = HandoffState.READY
+        t.retries_used = int(data.get("retries_used", 0))
+        for h in data.get("history", []) or []:
+            try:
+                t.history.append(Transition(**h))
+            except TypeError:
+                continue
+        return t

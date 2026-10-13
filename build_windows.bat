@@ -2,6 +2,7 @@
 REM Muse Bridge - Windows build script (THE single packaging step).
 REM Run this on your Windows PC: double-click build_windows.bat
 REM Requires: Python 3.10+ from python.org (check "Add python.exe to PATH").
+REM The finished EXE needs no Python - this script is only for building it.
 setlocal
 
 where python >nul 2>nul
@@ -12,14 +13,13 @@ if errorlevel 1 (
   exit /b 1
 )
 
-echo Installing dependencies...
+echo Installing build tools...
 python -m pip install --upgrade pip
-python -m pip install pyinstaller pywinauto pyautogui
+python -m pip install pyinstaller pywinauto
 
 echo Building MuseBridge.exe ...
 python -m PyInstaller --noconfirm --onefile --windowed ^
   --name MuseBridge ^
-  --add-data "README.md;." ^
   main.py
 
 if errorlevel 1 (
@@ -32,5 +32,6 @@ echo.
 echo ============================================================
 echo  DONE: dist\MuseBridge.exe
 echo  Double-click it to start. No Python needed afterwards.
+echo  No API keys. No fees. Just your ChatGPT + Muse windows.
 echo ============================================================
 pause

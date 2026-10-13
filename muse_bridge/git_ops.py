@@ -62,10 +62,20 @@ def has_uncommitted(path: str | Path) -> bool:
 
 
 def diff_names(path: str | Path) -> list[str]:
-    r = _run(Path(path), "diff", "--name-only", "HEAD")
+    # git status --short includes untracked files (??), so new files
+    # Muse created are detected too — not just modifications.
+    r = _run(Path(path), "status", "--short")
     if not r.ok:
         return []
-    return [l for l in r.stdout.splitlines() if l.strip()]
+    names: list[str] = []
+    for line in r.stdout.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) == 2:
+            # Handle renames: "R  old -> new".
+            name = parts[1].split(" -> ")[-1].strip().strip('"')
+            if name:
+                names.append(name)
+    return names
 
 
 # --- forbidden-content scan ----------------------------------------------

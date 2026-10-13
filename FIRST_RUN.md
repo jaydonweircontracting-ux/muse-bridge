@@ -2,53 +2,52 @@
 
 ## What you need
 - A Windows 10/11 PC (64-bit).
-- Your Muse window open (the app with your RPG project).
-- Either an OpenAI API key (https://platform.openai.com/api-keys) **or** the ChatGPT website open in your browser.
+- Your ChatGPT window open in your browser (signed in as usual).
+- Your Muse window open (signed in as usual).
+- Your Adventure Game V2 folder on the PC.
+- No API keys. No new accounts. No fees.
 
 ## Step 1 — Build the app (one time)
 1. Install Python 3.10+ from https://www.python.org/downloads/
    - On the first installer screen, check **"Add python.exe to PATH"**.
+   - (Python is only needed to *build* the app, never to run it.)
 2. Download this repository (Code → Download ZIP) and unzip it.
-3. Double-click **`build_windows.bat`**. It installs what it needs and builds the app.
+3. Double-click **`build_windows.bat`**. It builds the app.
 4. When it says DONE, open the **`dist`** folder and double-click **`MuseBridge.exe`**.
-   You never need Python again after this.
 
-## Step 2 — First-run wizard
-1. **Game repository:** click Browse and select your Adventure Game V2 folder.
-   The app checks it is a real git repo and shows the branch.
-2. **Muse window:** open Muse, then click "Detect windows…" and pick it.
-   > Note: the app can paste prompts into Muse, but detecting *when Muse
-   > finishes* has no perfect signal. The app watches for the response to
-   > go quiet and will ask you to confirm before anything risky.
-3. **ChatGPT:** choose one:
-   - **API (recommended):** paste your OpenAI API key, click Test. Planning and
-     code review then run fully automatically. Your key never leaves your PC.
-   - **Website (manual):** the app shows you each prompt; you paste ChatGPT's
-     finished answer back in. Slower, but no key needed.
-4. **Starter prompt:** paste your one big RPG instruction (goals, architecture
-   rules, what "done" means). The app saves it — you never paste it again.
+## Step 2 — One-time setup
+1. **ChatGPT window:** click Detect, pick your ChatGPT browser window, then
+   Test focus to prove the bridge can bring it forward.
+2. **Muse window:** same — Detect, pick, Test focus.
+3. **Game folder:** Browse to your Adventure Game V2 folder. The bridge
+   verifies it's a git repo and reads its real details (React/Vite,
+   scripts, detected systems) into your project profile.
+4. **Master prompt:** paste your one big RPG instruction. The bridge saves it
+   — you never paste it again.
 
-## Step 3 — Go
-1. Click **TEST CONNECTIONS** — all green before real work starts.
-2. Click **START**. The app will:
-   - pick one small task from the backlog,
-   - ask ChatGPT to define what "done" looks like,
-   - paste the task into Muse and wait for the *complete* response,
-   - check the repo actually changed, run tests and the build,
-   - ask ChatGPT to review the real evidence,
-   - commit only if everything passes, then move to the next task.
-3. **PAUSE** stops new tasks. **STOP** halts everything. **RUN ONE CYCLE** does a single task.
+## Step 3 — The daily routine
+1. Open `MuseBridge.exe`.
+2. Press **START** (or **NEXT HANDOFF**).
+3. The bridge copies a prompt and tells you what to do, e.g.:
+   *"Paste this into ChatGPT, submit, then paste the completed response below."*
+4. Paste the response into the bridge's transfer box → **SAVE TRANSFERRED RESPONSE**.
+5. For Muse tasks: paste the task into Muse, press **MUSE TASK SUBMITTED**,
+   and only press **MUSE DONE — I CONFIRM** when Muse has actually finished.
+   The bridge never guesses.
+6. Paste Muse's report back → the bridge runs your tests/build automatically.
+7. Press **COPY RESPONSE FOR REVIEW** → run it in ChatGPT → paste the review back.
+8. APPROVE → checkpoint saved, next task queued. REJECT → correction prepared.
 
 ## If something goes wrong
-- **VIEW LOGS** shows everything the app did, with timestamps.
-- **EXPORT DIAGNOSTICS** (in the logs view) saves a file you can send for help —
-  it never includes your API key.
-- Close and reopen the app any time: tasks, history, and checkpoints are saved
-  automatically. Use the handoff summary in the logs to see where it left off.
+- **VIEW TASK QUEUE** / **VIEW HISTORY** — see everything.
+- **EXPORT DIAGNOSTICS** — saves a file you can send for help.
+  (The app stores no passwords or keys, so there's nothing to leak.)
+- Close and reopen any time: the bridge restores exactly where you left off
+  and tells you what was happening.
+- **PAUSE** stops new handoffs. **STOP** stands down without deleting history.
 
-## Limits you control (Settings)
-- Max development cycles per session (default 10)
-- Max retries per task (default 3)
-- Response timeout (default 10 minutes)
-- Pause after a failure (default on)
-- Manual approval for risky diffs (default on)
+## The one thing the bridge can't do for you
+Transferring ChatGPT's response through the bridge is manual — that's the
+price of the free edition, and it's deliberate: the bridge must never claim
+to have read a response you haven't transferred. The transfer box means
+copy + paste, never retyping.

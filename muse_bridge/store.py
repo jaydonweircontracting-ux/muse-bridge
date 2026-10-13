@@ -52,25 +52,15 @@ def _write_json(path: Path, obj: Any) -> None:
 DEFAULT_SETTINGS: dict[str, Any] = {
     "game_repo_path": "",
     "game_repo_verified": False,
+    "chatgpt_window_title": "",
     "muse_window_title": "",
-    "muse_input_verified": False,
-    "muse_completion_mode": "uncertain",  # honest default
-    "chatgpt_mode": "api",  # or "manual"
-    "openai_api_key": "",   # stored locally only, never logged
-    "openai_model": "gpt-4o-mini",
-    "max_cycles_per_session": 10,
+    "windows_verified": False,
     "max_retries": 3,
-    "response_timeout_s": 600,
-    "task_time_limit_s": 3600,
     "pause_after_failure": True,
     "require_approval_for_risky": True,
     "first_run_complete": False,
-    # ChatGPT / spending (OpenAI API is billed separately from ChatGPT Plus)
-    "spend_limit_usd": 5.00,
-    "price_overrides": {},
-    # Muse integration: "cli" preferred, "window" fallback
-    "muse_mode": "cli",
-    "muse_cli_template": "",
+    # No API keys, no paid integrations in this edition. Nothing secret
+    # is stored at all.
 }
 
 
@@ -145,6 +135,15 @@ class TaskQueue:
                 self.save()
                 return True
         return False
+
+    def get(self, task_id: str) -> Task | None:
+        for t in self.tasks:
+            if t.id == task_id:
+                return t
+        return None
+
+    def all(self) -> list[Task]:
+        return list(self.tasks)
 
     def counts(self) -> dict[str, int]:
         c: dict[str, int] = {}
