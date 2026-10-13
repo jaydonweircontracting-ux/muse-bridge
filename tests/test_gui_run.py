@@ -347,6 +347,45 @@ class TestGuiRunControl(unittest.TestCase):
         self.assertTrue(any("watchdog" in r["kind"] or "disappeared" in r["message"]
                             for r in self.app.log.tail(20)))
 
+    def test_relay_toggle_requires_both_windows(self) -> None:
+        from tkinter import messagebox
+        orig_info = messagebox.showinfo
+        orig_ask = messagebox.askyesno
+        infos: list[str] = []
+        try:
+            messagebox.showinfo = lambda *a, **k: infos.append(str(a))
+            messagebox.askyesno = lambda *a, **k: True
+            # No windows mapped yet -> refused with explanation.
+            self.app._w_relay_toggle("w1")
+            self.assertFalse(self.app.relay.pair_for("w1").enabled)
+            self.assertTrue(infos, "expected an explanatory popup")
+            # Map both windows, then enable.
+            orch = self.app.orch
+            orch.workers.bind_session("w1", "Fake muse win")
+            orch.workers.map_chatgpt("w1", "Fake chatgpt win")
+            self.app._w_relay_toggle("w1")
+            self.assertTrue(self.app.relay.pair_for("w1").enabled)
+            # Toggle off again.
+            self.app._w_relay_toggle("w1")
+            self.assertFalse(self.app.relay.pair_for("w1").enabled)
+        finally:
+            messagebox.showinfo = orig_info
+            messagebox.askyesno = orig_ask
+
+    def test_relay_opt_in_persists(self) -> None:
+        from tkinter import messagebox
+        orig_ask = messagebox.askyesno
+        try:
+            messagebox.askyesno = lambda *a, **k: True
+            orch = self.app.orch
+            orch.workers.bind_session("w1", "Fake muse win")
+            orch.workers.map_chatgpt("w1", "Fake chatgpt win")
+            self.app._w_relay_toggle("w1")
+            self.assertTrue(
+                self.app.settings.get("relay_enabled", {}).get("w1"))
+        finally:
+            messagebox.askyesno = orig_ask
+
     def test_hotkey_during_wizard_does_not_crash(self) -> None:
         """Ctrl+Shift+S before the dashboard exists: no run bar yet, but the
         hotkey must not crash — start just reports no verified workers."""

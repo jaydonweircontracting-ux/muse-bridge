@@ -19,6 +19,7 @@ from typing import Callable
 from . import __version__ as APP_VERSION
 from . import git_ops, muse_link
 from .hotkeys import (HotkeyBinding, HotkeyManager, find_conflict, vk_label)
+from .relay import RelayController
 from .hotkey_config import (binding_for, load_bindings, reset_bindings,
                             save_binding)
 from .orchestrator import Orchestrator
@@ -70,6 +71,16 @@ class BridgeApp:
         # Bot-client run control: START/STOP + global hotkeys.
         self.run_ctl = RunController(orch=self.orch)
         self.run_ctl.on_event = lambda msg: self.log.append("run", msg)
+        # Automatic chat relay between paired Muse/ChatGPT windows.
+        # Opt-in per pair; F1 (run loop) drives its polling.
+        self.relay = RelayController(self.orch.ledger,
+                                     self._make_relay_agent,
+                                     poll_interval_s=30.0)
+        self.relay.get_worker = self.orch.workers.get
+        # Restore relay opt-ins (pairs re-baseline on first poll).
+        for wid, en in self.settings.get("relay_enabled", {}).items():
+            if en:
+                self.relay.pair_for(wid).enabled = True
         self.hotkeys = HotkeyManager(dispatch=lambda cb: self.root.after(0, cb))
         self._run_bar_widgets: dict = {}
         self._setup_hotkeys()
@@ -316,10 +327,47 @@ class BridgeApp:
             messagebox.showwarning("Run control", msg)
         self._refresh_run_bar()
 
+    def _make_relay_agent(self, worker_id: str, role: str):
+        """Build a UIA window agent for a relay pair, resolving the live
+        HWND (handle first, title re-search as fallback)."""
+        from . import uia_agent
+        slot = self.orch.workers.get(worker_id)
+        handle = 0
+        title = ""
+        if slot:
+            if role == "muse":
+                handle, title = slot.window_handle, slot.window_title
+            else:
+                handle, title = slot.chatgpt_handle, slot.chatgpt_window
+        if handle and muse_link.is_handle_alive(handle):
+            return uia_agent.agent_for(handle, role)
+        # Handle dead/unknown: re-resolve by exact title.
+        fresh = muse_link.find_handle(title) if title else None
+        if not fresh:
+            raise RuntimeError(
+                f"no live window for {slot.label if slot else worker_id} "
+                f"({role}) — re-bind it")
+        # Refresh the stored handle for next time.
+        if slot:
+            if role == "muse":
+                slot.window_handle = fresh
+            else:
+                slot.chatgpt_handle = fresh
+            self.orch.workers.save()
+        return uia_agent.agent_for(fresh, role)
+
     def _run_tick(self) -> None:
         try:
             events = self.run_ctl.tick()
             if events:
+                self._refresh_workers_tab_if_visible()
+            # F1's run loop also drives the automatic relay for enabled
+            # pairs. F2/F3 stop/pause it along with the loop.
+            if self.run_ctl.state == RunState.RUNNING:
+                for line in self.relay.poll():
+                    self.log.append("relay", line)
+                while self.relay.events:
+                    self.log.append("relay", self.relay.events.pop(0))
                 self._refresh_workers_tab_if_visible()
         except Exception as exc:
             self.log.append("run", f"Tick error: {exc}")
@@ -707,6 +755,8 @@ class BridgeApp:
                 ("Verify session", lambda w=wid: self._w_verify(w)),
                 ("Pause/Resume", lambda w=wid: self._w_pause_toggle(w)),
                 ("Mode", lambda w=wid: self._w_mode_toggle(w)),
+                ("Relay", lambda w=wid: self._w_relay_toggle(w)),
+                ("Relay now", lambda w=wid: self._w_relay_now(w)),
                 ("Prepare handoff", lambda w=wid: self._w_handoff(w)),
                 ("Submitted", lambda w=wid: self._w_submitted(w)),
                 ("Done — confirm", lambda w=wid: self._w_done(w)),
@@ -835,6 +885,54 @@ class BridgeApp:
         self.log.append(
             "app", f"{slot.label} mode -> {new_mode} "
                    f"({'run loop will schedule it' if new_mode == 'supervised' else 'user drives it from the row buttons only'}).")
+        self._refresh_workers()
+
+    def _w_relay_toggle(self, wid: str) -> None:
+        """Opt-in per pair: the relay watches this worker's Muse window
+        and shuttles new content through its paired ChatGPT window while
+        the run loop is running (F1)."""
+        from .relay import RelayState
+        slot = self.orch.workers.get(wid)
+        if not slot:
+            return
+        pair = self.relay.pair_for(wid)
+        if pair.enabled:
+            self.relay.set_enabled(wid, False)
+            self.log.append("app", f"{slot.label}: automatic relay disabled.")
+        else:
+            if not slot.window_title or not slot.chatgpt_window:
+                messagebox.showinfo(
+                    "Relay",
+                    f"{slot.label} needs both a Muse window (Bind window) "
+                    f"and a ChatGPT window (Map ChatGPT) before the relay "
+                    f"can run.")
+                return
+            if not messagebox.askyesno(
+                    "Enable automatic relay",
+                    f"Enable automatic relay for {slot.label}?\n\n"
+                    f"The bridge will read its Muse window, type into its "
+                    f"ChatGPT window, and deliver responses back — "
+                    f"automatically while the run loop runs.\n\n"
+                    f"Note: automating ChatGPT's web UI is against OpenAI's "
+                    f"terms for automated access and could risk the ChatGPT "
+                    f"account. Proceed only if you accept that."):
+                return
+            self.relay.set_enabled(wid, True)
+            self.log.append("app", f"{slot.label}: automatic relay enabled "
+                                   f"(baseline on next poll).")
+        enabled_map = self.settings.get("relay_enabled", {})
+        enabled_map[wid] = pair.enabled
+        self.settings.set("relay_enabled", enabled_map)
+        self._refresh_workers()
+
+    def _w_relay_now(self, wid: str) -> None:
+        pair = self.relay.pair_for(wid)
+        if not pair.enabled:
+            messagebox.showinfo("Relay", "Enable the relay for this pair first.")
+            return
+        status = self.relay.poll_pair(wid)
+        self.log.append("relay", f"{wid}: {status}")
+        messagebox.showinfo("Relay", status)
         self._refresh_workers()
 
     def _watchdog(self) -> None:
@@ -1047,9 +1145,15 @@ class BridgeApp:
             pair_s = f"  chatgpt={'«' + pair[:40] + '»' if pair else '—'}"
             paused_s = "  [PAUSED]" if row.get("paused") else ""
             mode_s = f"  mode={row.get('mode', 'supervised')}"
+            pair = self.relay.pair_for(wid)
+            relay_s = ""
+            if pair.enabled:
+                relay_s = f"  relay={pair.state}"
+                if pair.error:
+                    relay_s += f"(! {pair.error[:60]})"
             self._worker_rows[wid]["info"].set(
                 f"[{row['connection']}] state={row['state']}  task={row['task'] or '—'}  "
-                f"branch={row['branch'] or '—'}{acct_s}{pair_s}{paused_s}{mode_s}{waiting}\n"
+                f"branch={row['branch'] or '—'}{acct_s}{pair_s}{paused_s}{mode_s}{relay_s}{waiting}\n"
                 f"files: {files or '—'}   last test: {row['last_test'] or '—'}   "
                 f"errors={row['errors']} retries={row['retries']}   last activity: {idle_s}"
                 + (f"   note: {row['note']}" if row["note"] else ""))

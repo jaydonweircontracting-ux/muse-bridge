@@ -94,6 +94,29 @@ def window_exists(title: str) -> bool:
     return any(w.title == title for w in list_windows(""))
 
 
+def find_handle(title: str) -> int | None:
+    """Resolve a window title to its HWND handle (exact match). Handles
+    are the reliable identity; titles are for humans. Returns None when
+    the window isn't found or automation is unavailable."""
+    if not IS_WINDOWS or not _have_pywinauto() or not title:
+        return None
+    for w in list_windows(""):
+        if w.title == title:
+            return w.handle or None
+    return None
+
+
+def is_handle_alive(handle: int) -> bool:
+    """Is this HWND still a live window?"""
+    if not IS_WINDOWS or not _have_pywinauto() or not handle:
+        return False
+    try:
+        import ctypes
+        return bool(ctypes.windll.user32.IsWindow(handle))
+    except Exception:
+        return False
+
+
 def focus_window(title: str) -> bool:
     """Bring the selected window to the foreground. Returns success."""
     if not IS_WINDOWS or not _have_pywinauto():

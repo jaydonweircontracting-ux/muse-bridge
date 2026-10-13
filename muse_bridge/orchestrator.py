@@ -123,14 +123,22 @@ class Orchestrator:
                 f"report between <REPORT> and </REPORT> tags.")
 
     def _verify_destination(self, slot, kind: str = "Muse") -> tuple[bool, str]:
-        """Pre-send destination verification. The mapped window must exist
-        right now under its exact title — a partial match is ambiguous and
-        does not count. Never send when the destination can't be confirmed."""
-        title = (slot.window_title if kind == "Muse"
-                 else slot.chatgpt_window)
+        """Pre-send destination verification. Identity is checked by HWND
+        handle first (reliable), falling back to exact title re-search.
+        A partial title match is ambiguous and does not count. Never send
+        when the destination can't be confirmed."""
+        is_muse = kind == "Muse"
+        title = slot.window_title if is_muse else slot.chatgpt_window
+        handle = slot.window_handle if is_muse else slot.chatgpt_handle
         if not title:
             return False, (f"{slot.label} has no {kind} window mapped. "
                            "Map it first — the message was NOT sent.")
+        try:
+            from . import muse_link
+            if handle and muse_link.is_handle_alive(handle):
+                return True, ""
+        except Exception:
+            pass
         check = self.window_exists
         if check is None:
             return True, ""  # headless/test mode: nothing to verify against
@@ -139,6 +147,17 @@ class Orchestrator:
                 f"{slot.label}'s {kind} window '{title[:60]}' was not found. "
                 "The message was NOT sent — the window may be closed or "
                 "renamed. Re-bind it and try again.")
+        # Title re-found but handle died: refresh the handle for next time.
+        try:
+            from . import muse_link as ml
+            new_handle = ml.find_handle(title) or 0
+            if is_muse:
+                slot.window_handle = new_handle
+            else:
+                slot.chatgpt_handle = new_handle
+            self.workers.save()
+        except Exception:
+            pass
         return True, ""
 
     def _latest_handoff(self, worker_id: str):

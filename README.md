@@ -237,6 +237,40 @@ Up to five Muse workers collaborate on the **same** Adventure Game V2 repo:
   verification, ledger counts, queue, errors, version) with a redacted
   export that hashes window titles; config backup/restore as a zip.
 
+## Automatic chat relay (opt-in per pair)
+
+Each worker can have its own Muse window **and** its own dedicated
+ChatGPT window. The relay remembers which windows belong together and
+shuttles messages automatically — no API, no copy/paste after setup:
+
+1. **Bind** each worker's Muse window; **Map ChatGPT** to its dedicated
+   conversation window. Windows are remembered by OS handle (HWND),
+   falling back to exact title re-search — never coordinates.
+2. Optionally set the expected conversation URL (stored per worker);
+   the relay verifies it before every send and blocks on mismatch.
+3. Press **Relay** on the worker row to opt in (explicit consent —
+   automating ChatGPT's web UI is against OpenAI's terms for automated
+   access and could risk the account).
+4. Press **F1** (START): the run loop polls each enabled pair (~30s).
+   New Muse content → verified ChatGPT conversation → complete
+   response → back to the Muse window. **F2** stops safely, **F3**
+   pauses/resumes.
+5. **Relay now** triggers one pair immediately.
+
+Safety rules: one pair relays at a time (no focus fights); responses
+must be stable and complete before delivery (a streaming pause doesn't
+count); the bridge's own deliveries are never re-relayed (echo guard);
+retries never resend an already-submitted message (ledger content-hash
+check); any ambiguity, login wall, CAPTCHA, or timeout pauses only
+that pair with a plain-English error and NEEDS_REVIEW — never blind
+retries. Every step is recorded in the message ledger.
+
+Honest limits: the UIA window agents (`uia_agent.py`) are UNVERIFIED —
+they were written without access to a Windows ChatGPT/Muse session and
+must be confirmed on your PC before the relay is trusted. ChatGPT/Muse
+UI changes can break control detection; the relay fails safe (pauses)
+rather than clicking blindly.
+
 ## Verification status
 
 - 55/55 unit tests pass (handoff + orchestration + accounts + GitHub).

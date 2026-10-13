@@ -61,7 +61,10 @@ class WorkerSlot:
     label: str                   # "Muse 1" (user-editable)
     role: str                    # configurable role
     window_title: str = ""       # bound Muse window/session
+    window_handle: int = 0       # HWND at bind time (0 = unknown)
     chatgpt_window: str = ""     # mapped ChatGPT conversation window
+    chatgpt_handle: int = 0      # HWND at map time (0 = unknown)
+    chatgpt_url: str = ""        # expected conversation URL/identifier
     account_id: str = ""         # linked account (BUILD 2)
     paused: bool = False         # excluded from scheduling while paused
     mode: str = "supervised"     # "manual" (user drives) or "supervised"
@@ -176,6 +179,11 @@ class WorkerManager:
         if not s:
             return False
         s.window_title = window_title
+        try:
+            from . import muse_link
+            s.window_handle = muse_link.find_handle(window_title) or 0
+        except Exception:
+            s.window_handle = 0
         s.session_verified = False
         s.verified_at = 0.0
         if WorkerState(s.state) == WorkerState.OFFLINE:
@@ -183,12 +191,20 @@ class WorkerManager:
         self.save()
         return True
 
-    def map_chatgpt(self, worker_id: str, window_title: str) -> bool:
+    def map_chatgpt(self, worker_id: str, window_title: str,
+                    url: str = "") -> bool:
         """Map a worker to its dedicated ChatGPT conversation window."""
         s = self.get(worker_id)
         if not s:
             return False
         s.chatgpt_window = window_title
+        if url:
+            s.chatgpt_url = url
+        try:
+            from . import muse_link
+            s.chatgpt_handle = muse_link.find_handle(window_title) or 0
+        except Exception:
+            s.chatgpt_handle = 0
         self.save()
         return True
 
