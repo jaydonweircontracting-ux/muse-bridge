@@ -59,6 +59,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "pause_after_failure": True,
     "require_approval_for_risky": True,
     "first_run_complete": False,
+    "max_queue_size": 50,      # backpressure: refuse new tasks past this
+    "max_prompt_chars": 8000,  # backpressure: refuse oversized prompts
     # No API keys, no paid integrations in this edition. Nothing secret
     # is stored at all.
 }
@@ -115,18 +117,26 @@ class Task:
 
 
 class TaskQueue:
-    def __init__(self, directory: Path | None = None) -> None:
+    def __init__(self, directory: Path | None = None,
+                 max_size: int | None = None) -> None:
         self.dir = directory or data_dir()
         self.path = self.dir / "queue.json"
         raw: list[dict[str, Any]] = _read_json(self.path, [])
         self.tasks: list[Task] = [Task(**t) for t in raw]
+        self.max_size = max_size  # backpressure; None = unbounded
 
     def save(self) -> None:
         _write_json(self.path, [asdict(t) for t in self.tasks])
 
-    def add(self, task: Task) -> None:
+    def add(self, task: Task) -> bool:
+        """Backpressure: refuse when the queue is at its cap. Returns True
+        if the task was accepted."""
+        if self.max_size is not None and len(self.tasks) >= self.max_size:
+            return False
         self.tasks.append(task)
         self.save()
+        return True
+
 
     def active(self) -> Task | None:
         for t in self.tasks:

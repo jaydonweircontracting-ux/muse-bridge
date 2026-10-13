@@ -85,6 +85,15 @@ def list_windows(substring: str = "") -> list[WindowInfo]:
     return out
 
 
+def window_exists(title: str) -> bool:
+    """Pre-send destination verification: does a top-level window with
+    exactly this title exist right now? Exact match — a title that merely
+    *contains* the mapping is ambiguous and does not count."""
+    if not title:
+        return False
+    return any(w.title == title for w in list_windows(""))
+
+
 def focus_window(title: str) -> bool:
     """Bring the selected window to the foreground. Returns success."""
     if not IS_WINDOWS or not _have_pywinauto():

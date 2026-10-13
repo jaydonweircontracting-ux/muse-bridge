@@ -326,6 +326,27 @@ class TestGuiRunControl(unittest.TestCase):
             gui_mod._ask_choice = orig_ask
             muse_link.list_windows = orig_list
 
+    def test_watchdog_pauses_worker_with_vanished_window(self) -> None:
+        from muse_bridge import muse_link
+        from muse_bridge.workers import WorkerState
+        self._verify_worker("w1")
+        orch = self.app.orch
+        # Worker is mid-task with a mapped window...
+        orch.workers.set_state("w1", WorkerState.WORKING, "test")
+        # ...but the window is gone.
+        orig = muse_link.list_windows
+        try:
+            muse_link.list_windows = lambda substring="": []
+            self.app._watchdog()
+            self.root.update()
+        finally:
+            muse_link.list_windows = orig
+        slot = orch.workers.get("w1")
+        assert slot is not None
+        self.assertTrue(slot.paused)
+        self.assertTrue(any("watchdog" in r["kind"] or "disappeared" in r["message"]
+                            for r in self.app.log.tail(20)))
+
     def test_hotkey_during_wizard_does_not_crash(self) -> None:
         """Ctrl+Shift+S before the dashboard exists: no run bar yet, but the
         hotkey must not crash — start just reports no verified workers."""
@@ -390,6 +411,9 @@ class TestGuiRunControl(unittest.TestCase):
 
         self._verify_worker("w1")
         orch.queue.add(Task(id="task-9", title="Lifecycle test"))
+
+        # Simulate the Windows environment: the bound window exists.
+        orch.window_exists = lambda title: True
 
         # START, one tick: assign + auto handoff (worktree created).
         self.app._run_btn.invoke()

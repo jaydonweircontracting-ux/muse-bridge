@@ -64,6 +64,10 @@ class WorkerSlot:
     chatgpt_window: str = ""     # mapped ChatGPT conversation window
     account_id: str = ""         # linked account (BUILD 2)
     paused: bool = False         # excluded from scheduling while paused
+    mode: str = "supervised"     # "manual" (user drives) or "supervised"
+                                 # (run loop may schedule, every send confirmed).
+                                 # There is no fully-autonomous mode: the bridge
+                                 # never submits into ChatGPT/Muse on its own.
     state: str = WorkerState.OFFLINE.value
     session_verified: bool = False
     verified_at: float = 0.0
@@ -83,6 +87,7 @@ class WorkerSlot:
     def available(self) -> bool:
         return (self.session_verified
                 and not self.paused
+                and self.mode == "supervised"
                 and WorkerState(self.state) == WorkerState.READY)
 
 
@@ -187,6 +192,16 @@ class WorkerManager:
         self.save()
         return True
 
+    def chatgpt_owner(self, window_title: str,
+                      exclude: str = "") -> WorkerSlot | None:
+        """One-to-one lock: which worker already owns this ChatGPT window?"""
+        if not window_title:
+            return None
+        for s in self.slots:
+            if s.id != exclude and s.chatgpt_window == window_title:
+                return s
+        return None
+
     def set_paused(self, worker_id: str, paused: bool) -> bool:
         """Pause/resume a single worker. Paused workers are excluded from
         scheduling but keep their state, branch, and task."""
@@ -194,6 +209,19 @@ class WorkerManager:
         if not s:
             return False
         s.paused = paused
+        self.save()
+        return True
+
+    def set_mode(self, worker_id: str, mode: str) -> bool:
+        """Manual: the run loop never auto-schedules this worker (the user
+        drives it from the row buttons). Supervised: the run loop may
+        schedule it, but every message exchange is still user-confirmed."""
+        if mode not in ("manual", "supervised"):
+            return False
+        s = self.get(worker_id)
+        if not s:
+            return False
+        s.mode = mode
         self.save()
         return True
 
@@ -258,7 +286,8 @@ class WorkerManager:
                 "connection": ("verified" if s.session_verified
                                else ("bound" if s.window_title else "offline")),
                 "state": s.state, "task": s.task_id,
-                "paused": s.paused, "chatgpt_window": s.chatgpt_window,
+                "paused": s.paused, "mode": s.mode,
+                "chatgpt_window": s.chatgpt_window,
                 "workspace": s.workspace, "branch": s.branch,
                 "files": list(s.expected_files),
                 "waiting_for_user": s.state == WorkerState.WAITING_FOR_USER.value,

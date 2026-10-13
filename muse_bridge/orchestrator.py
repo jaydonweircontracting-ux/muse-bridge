@@ -21,6 +21,9 @@ from . import git_ops
 from .accounts import AccountManager
 from .handoff import build_dev_prompt, extract_tagged, new_id
 from .integrate import IntegrationGate
+from .ledger import (ACKNOWLEDGED, COPIED, DELIVERED, DETECTED, FAILED,
+                     NEEDS_REVIEW, QUEUED, RESPONSE_RECEIVED, SUBMITTED,
+                     MessageLedger)
 from .ownership import OwnershipRegistry
 from .profile import ProjectProfile
 from .scheduler import Scheduler
@@ -42,19 +45,22 @@ class Orchestrator:
         d = directory or data_dir()
         self.settings = Settings(d)
         self.log = EventLog(d)
-        self.queue = TaskQueue(d)
+        self.queue = TaskQueue(d, max_size=self.settings.get("max_queue_size", 50))
         self.checkpoints = Checkpoints(d)
         self.brief = Brief(d)
         self.profile = ProjectProfile(d)
         self.workers = WorkerManager(d)
         self.ownership = OwnershipRegistry(d)
         self.accounts = AccountManager(d)
+        self.ledger = MessageLedger(d)
         self.scheduler = Scheduler(self.queue, self.workers, self.ownership)
         self._worktrees: WorktreeManager | None = None
 
-        # GUI-supplied: focus_window(title)->bool, copy_text(str)->None
+        # GUI-supplied: focus_window(title)->bool, copy_text(str)->None,
+        # window_exists(title)->bool (destination verification before send)
         self.focus_window: Callable[[str], bool] | None = None
         self.copy_text: Callable[[str], None] | None = None
+        self.window_exists: Callable[[str], bool] | None = None
 
     # -- repo / worktrees --------------------------------------------------
     def repo(self) -> Path | None:
@@ -116,17 +122,56 @@ class Orchestrator:
                 f"message 'bridge/{task.id}' and reply with your completion "
                 f"report between <REPORT> and </REPORT> tags.")
 
+    def _verify_destination(self, slot, kind: str = "Muse") -> tuple[bool, str]:
+        """Pre-send destination verification. The mapped window must exist
+        right now under its exact title — a partial match is ambiguous and
+        does not count. Never send when the destination can't be confirmed."""
+        title = (slot.window_title if kind == "Muse"
+                 else slot.chatgpt_window)
+        if not title:
+            return False, (f"{slot.label} has no {kind} window mapped. "
+                           "Map it first — the message was NOT sent.")
+        check = self.window_exists
+        if check is None:
+            return True, ""  # headless/test mode: nothing to verify against
+        if not check(title):
+            return False, (
+                f"{slot.label}'s {kind} window '{title[:60]}' was not found. "
+                "The message was NOT sent — the window may be closed or "
+                "renamed. Re-bind it and try again.")
+        return True, ""
+
+    def _latest_handoff(self, worker_id: str):
+        msgs = [m for m in self.ledger.by_worker(worker_id)
+                if m.kind == "handoff"]
+        msgs.sort(key=lambda m: m.created_at, reverse=True)
+        return msgs[0] if msgs else None
+
     def prepare_worker_handoff(self, worker_id: str) -> OpResult:
         slot = self.workers.get(worker_id)
         if not slot or not slot.task_id:
             return OpResult(False, "Worker has no assigned task.")
         if WorkerState(slot.state) != WorkerState.ASSIGNED:
             return OpResult(False, f"Worker is {slot.state}, not ASSIGNED.")
+        ok, reason = self._verify_destination(slot, "Muse")
+        if not ok:
+            return OpResult(False, reason)
         prompt = self.worker_prompt(worker_id)
+        max_chars = self.settings.get("max_prompt_chars", 8000)
+        if len(prompt) > max_chars:
+            return OpResult(
+                False,
+                f"Handoff prompt is {len(prompt)} chars (cap {max_chars}). "
+                "Split the task into smaller pieces — oversized prompts "
+                "get truncated or rejected by chat windows.")
+        msg = self.ledger.create(worker_id, slot.task_id, "handoff", prompt)
+        self.ledger.transition(msg.id, QUEUED, f"assigned to {slot.label}")
         if self.copy_text:
             self.copy_text(prompt)
         if self.focus_window and slot.window_title:
             self.focus_window(slot.window_title)
+        self.ledger.transition(msg.id, COPIED,
+                              "prompt copied; worker window focused")
         self.workers.set_state(worker_id, WorkerState.WORKING,
                                "task handed to session")
         self.workers.touch(worker_id)
@@ -138,15 +183,28 @@ class Orchestrator:
 
     def worker_submitted(self, worker_id: str) -> OpResult:
         slot = self.workers.get(worker_id)
-        if not slot or WorkerState(slot.state) != WorkerState.WORKING:
+        if not slot:
+            return OpResult(False, "Worker not found.")
+        state = WorkerState(slot.state)
+        msg = self._latest_handoff(worker_id)
+        if (state == WorkerState.WAITING_FOR_RESPONSE and msg is not None
+                and msg.state == SUBMITTED):
+            # Duplicate confirm (e.g. double-click) — already recorded,
+            # harmless no-op rather than an error.
+            return OpResult(True,
+                            f"{slot.label}: submission already recorded.")
+        if state != WorkerState.WORKING:
             return OpResult(False, "Worker is not in WORKING state.")
+        if msg is not None:
+            self.ledger.transition(msg.id, SUBMITTED, "user confirmed paste")
         self.workers.set_state(worker_id, WorkerState.WAITING_FOR_RESPONSE,
                                "session working (user-confirmed submit)")
         self.workers.touch(worker_id)
         return OpResult(True, f"{slot.label}: submitted. Confirm completion only when it is real.")
 
     def worker_done(self, worker_id: str) -> OpResult:
-        """User confirms the session actually finished. Never auto-detected."""
+        """User confirms the session actually finished. Never auto-detected.
+        The ledger message stays in flight until the report is transferred."""
         slot = self.workers.get(worker_id)
         if not slot or WorkerState(slot.state) not in (
                 WorkerState.WORKING, WorkerState.WAITING_FOR_RESPONSE):
@@ -168,6 +226,14 @@ class Orchestrator:
             task.evidence["muse_report"] = (extract_tagged(text, "REPORT")
                                             or text.strip())[:4000]
             self.queue.save()
+        msg = self._latest_handoff(worker_id)
+        if msg is not None:
+            if msg.state == SUBMITTED:
+                self.ledger.transition(msg.id, RESPONSE_RECEIVED,
+                                       "report transferred by user")
+            if msg.state == RESPONSE_RECEIVED:
+                self.ledger.transition(msg.id, DELIVERED,
+                                       "report attached to task")
         self.workers.set_state(worker_id, WorkerState.REVIEW,
                                "report transferred; ready for integration gate")
         self.workers.touch(worker_id)
@@ -204,6 +270,11 @@ class Orchestrator:
             wt.remove(ws)
             self.workers.release(worker_id, f"Integrated {task.id}.")
             self.workers.set_state(worker_id, WorkerState.PASSED, task.id)
+            # The handoff round-trip is complete: evidence merged.
+            msg = self._latest_handoff(worker_id)
+            if msg is not None and msg.state == DELIVERED:
+                self.ledger.transition(msg.id, ACKNOWLEDGED,
+                                       f"integrated into {gate.target_branch}")
             # PASSED is informational; return slot to READY for next work.
             self.workers.set_state(worker_id, WorkerState.READY, "")
             self.log.append("orchestrator", f"{task.id} PASSED and integrated.")
@@ -245,6 +316,16 @@ class Orchestrator:
                          if isinstance(task.evidence, dict) else ""))
         if self.copy_text:
             self.copy_text(packet)
+        msg = self.ledger.create(worker_id, task.id, "review_packet", packet)
+        self.ledger.transition(msg.id, QUEUED, f"packet for {slot.label}")
+        if slot.chatgpt_window:
+            ok, reason = self._verify_destination(slot, "ChatGPT")
+            if not ok:
+                self.ledger.transition(msg.id, NEEDS_REVIEW, reason)
+                return False, reason
+        self.ledger.transition(msg.id, COPIED,
+                               "packet copied; paste into the mapped "
+                               "ChatGPT conversation")
         self.log.append("orchestrator",
                         f"Review packet prepared for {task.id} "
                         f"({len(changed)} files).")

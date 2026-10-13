@@ -211,6 +211,31 @@ Up to five Muse workers collaborate on the **same** Adventure Game V2 repo:
 - **Per-worker pause.** **Pause/Resume** on a worker row excludes that slot
   from scheduling (it keeps its state, branch, and task); the run loop's
   F1/F2/F3 control the loop only, never individual workers.
+- **Autonomy modes.** Each worker is **Manual** (you drive it from the row
+  buttons; the run loop never auto-schedules it) or **Supervised** (the
+  run loop may schedule it, but every message exchange is still
+  user-confirmed). There is deliberately no fully-autonomous mode.
+- **Pre-send destination verification.** Before any handoff prompt or
+  review packet is copied, the bridge re-checks that the mapped window
+  exists under its exact title. If not, the send is blocked with a
+  plain-English explanation — never sent to an ambiguous destination.
+- **One-to-one conversation lock.** Two workers can't accidentally share
+  one ChatGPT conversation; remapping asks for explicit confirmation.
+- **Durable message ledger.** Every handoff and review packet gets a
+  unique ID and explicit states (DETECTED → QUEUED → COPIED → SUBMITTED
+  → RESPONSE_RECEIVED → DELIVERED → ACKNOWLEDGED, plus FAILED and
+  NEEDS_REVIEW). Crash recovery moves anything mid-flight to
+  NEEDS_REVIEW instead of blindly repeating it; double-confirms are
+  harmless no-ops, not duplicates.
+- **Watchdog.** Every ~30s the bridge checks mapped windows still exist;
+  a vanished window pauses only that worker (queue/branch preserved)
+  with a plain-English explanation in the log.
+- **Backpressure.** Configurable queue cap (default 50) and prompt-size
+  cap (default 8000 chars); oversized items are refused with guidance,
+  not silently truncated.
+- **Diagnostics & backup.** One-click diagnostics (windows, pair
+  verification, ledger counts, queue, errors, version) with a redacted
+  export that hashes window titles; config backup/restore as a zip.
 
 ## Verification status
 

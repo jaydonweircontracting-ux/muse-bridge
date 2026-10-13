@@ -16,6 +16,7 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 from pathlib import Path
 from typing import Callable
 
+from . import __version__ as APP_VERSION
 from . import git_ops, muse_link
 from .hotkeys import (HotkeyBinding, HotkeyManager, find_conflict, vk_label)
 from .hotkey_config import (binding_for, load_bindings, reset_bindings,
@@ -59,6 +60,13 @@ class BridgeApp:
         self.orch = Orchestrator()
         self.orch.focus_window = muse_link.focus_window
         self.orch.copy_text = self._copy
+        self.orch.window_exists = muse_link.window_exists
+        # Crash recovery: anything left mid-flight becomes NEEDS_REVIEW
+        # instead of being blindly repeated.
+        recovered = self.orch.ledger.recover()
+        if recovered:
+            self.log.append("app", f"Recovered {len(recovered)} interrupted "
+                                   f"message(s) -> NEEDS_REVIEW.")
         # Bot-client run control: START/STOP + global hotkeys.
         self.run_ctl = RunController(orch=self.orch)
         self.run_ctl.on_event = lambda msg: self.log.append("run", msg)
@@ -674,6 +682,10 @@ class BridgeApp:
                    command=self._w_discover).pack(side="left", padx=4)
         ttk.Button(top, text="VERIFY PAIRS",
                    command=self._w_verify_pairs).pack(side="left", padx=4)
+        ttk.Button(top, text="DIAGNOSTICS",
+                   command=lambda: self._w_diagnostics(False)).pack(side="left", padx=4)
+        ttk.Button(top, text="BACKUP",
+                   command=self._w_backup).pack(side="left", padx=4)
         ttk.Label(parent, wraplength=920, padding=(10, 2),
                   text="A worker is only real when its session is verified. "
                        "Slots without a verified session never receive tasks — "
@@ -694,6 +706,7 @@ class BridgeApp:
                 ("Map ChatGPT", lambda w=wid: self._w_map_chatgpt(w)),
                 ("Verify session", lambda w=wid: self._w_verify(w)),
                 ("Pause/Resume", lambda w=wid: self._w_pause_toggle(w)),
+                ("Mode", lambda w=wid: self._w_mode_toggle(w)),
                 ("Prepare handoff", lambda w=wid: self._w_handoff(w)),
                 ("Submitted", lambda w=wid: self._w_submitted(w)),
                 ("Done — confirm", lambda w=wid: self._w_done(w)),
@@ -788,6 +801,15 @@ class BridgeApp:
         if choice is None:
             return
         title = "" if choice == -1 else wins[choice].title
+        if title:
+            # Strict one-to-one conversation lock: two workers must never
+            # share a ChatGPT conversation accidentally.
+            owner = self.orch.workers.chatgpt_owner(title, exclude=wid)
+            if owner is not None and not messagebox.askyesno(
+                    "Conversation already mapped",
+                    f"'{title[:60]}' is already {owner.label}'s dedicated "
+                    f"conversation.\n\nMove it to {slot.label} anyway?"):
+                return
         self.orch.workers.map_chatgpt(wid, title)
         self.log.append("app", f"{wid} ChatGPT -> '{title[:50]}'"
                                if title else f"{wid} ChatGPT mapping cleared.")
@@ -803,6 +825,104 @@ class BridgeApp:
                         f"{slot.label} {'paused' if paused else 'resumed'} "
                         f"(excluded from scheduling while paused).")
         self._refresh_workers()
+
+    def _w_mode_toggle(self, wid: str) -> None:
+        slot = self.orch.workers.get(wid)
+        if not slot:
+            return
+        new_mode = "manual" if slot.mode == "supervised" else "supervised"
+        self.orch.workers.set_mode(wid, new_mode)
+        self.log.append(
+            "app", f"{slot.label} mode -> {new_mode} "
+                   f"({'run loop will schedule it' if new_mode == 'supervised' else 'user drives it from the row buttons only'}).")
+        self._refresh_workers()
+
+    def _watchdog(self) -> None:
+        """Self-recovery check: detect vanished mapped windows and pause
+        the affected worker with a plain-English explanation. Never
+        deletes queued work — pause only."""
+        wins = {w.title for w in muse_link.list_windows("")}
+        for s in self.orch.workers.slots:
+            if s.paused or not s.window_title:
+                continue
+            if s.window_title not in wins and WorkerState(s.state) not in (
+                    WorkerState.OFFLINE, WorkerState.READY):
+                self.orch.workers.set_paused(s.id, True)
+                self.log.append(
+                    "watchdog",
+                    f"{s.label}'s window '{s.window_title[:50]}' disappeared "
+                    f"while it was {s.state}. Paused {s.label} — its task, "
+                    f"branch, and queue are preserved. Re-bind the window "
+                    f"and press Pause/Resume to continue.")
+                for m in self.orch.ledger.by_worker(s.id):
+                    if m.state in ("COPIED", "SUBMITTED", "RESPONSE_RECEIVED"):
+                        self.orch.ledger.transition(
+                            m.id, NEEDS_REVIEW,
+                            "worker window vanished mid-flight")
+        self._refresh_workers()
+
+    def _w_diagnostics(self, redacted: bool = False) -> None:
+        """One-click diagnostic report: windows, mappings, queue, ledger,
+        errors, version. Redacted export hashes window titles."""
+        import hashlib
+        wins = muse_link.list_windows("")
+        win_titles = {w.title for w in wins}
+        lines = ["MUSE BRIDGE DIAGNOSTICS",
+                 f"version: {APP_VERSION}",
+                 f"windows detected: {len(wins)}", ""]
+        lines.append("WORKER -> CHATGPT PAIRS:")
+        for s in self.orch.workers.slots:
+            def show(t: str) -> str:
+                if not t:
+                    return "—"
+                if redacted:
+                    return "sha256:" + hashlib.sha256(
+                        t.encode()).hexdigest()[:12]
+                return f"«{t[:60]}»"
+            muse_ok = bool(s.window_title) and s.window_title in win_titles
+            gpt_ok = bool(s.chatgpt_window) and s.chatgpt_window in win_titles
+            lines.append(
+                f"  {s.label}: mode={s.mode} paused={s.paused} "
+                f"state={s.state} task={s.task_id or '—'}")
+            lines.append(
+                f"    muse={show(s.window_title)} "
+                f"[{'FOUND' if muse_ok else 'MISSING'}]  "
+                f"chatgpt={show(s.chatgpt_window)} "
+                f"[{'FOUND' if gpt_ok else 'MISSING'}]")
+        lines.append("")
+        lines.append("MESSAGE LEDGER: " +
+                     ", ".join(f"{k}={v}"
+                               for k, v in
+                               self.orch.ledger.counts().items()) or "empty")
+        need = [m for m in self.orch.ledger.pending()
+                if m.state == NEEDS_REVIEW]
+        if need:
+            lines.append(f"NEEDS REVIEW ({len(need)}):")
+            for m in need[:10]:
+                lines.append(f"  {m.id[:8]} {m.kind} {m.worker_id} "
+                             f"{m.task_id} — {m.last_error[:80]}")
+        lines.append("")
+        lines.append("QUEUE: " +
+                     ", ".join(f"{t.id}:{t.status}"
+                               for t in self.orch.queue.all()[:20]))
+        lines.append("")
+        lines.append("RECENT ERRORS:")
+        for rec in self.log.tail(200):
+            if "error" in rec["kind"].lower() or "fail" in rec["message"].lower():
+                lines.append(f"  {rec['kind']}: {rec['message'][:120]}")
+        report = "\n".join(lines)
+        path = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            initialfile="muse-bridge-diagnostics.txt",
+            title="Save diagnostics (redacted)" if redacted
+            else "Save diagnostics")
+        if path:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(report + "\n")
+            self.log.append("app", f"Diagnostics saved to {path}")
+            messagebox.showinfo("Diagnostics", f"Saved to:\n{path}")
+        else:
+            _popup(self.root, "Diagnostics", report)
 
     def _w_verify_pairs(self) -> None:
         """Harmless end-to-end mapping test: re-find every mapped window by
@@ -926,9 +1046,10 @@ class BridgeApp:
             pair = row.get("chatgpt_window", "")
             pair_s = f"  chatgpt={'«' + pair[:40] + '»' if pair else '—'}"
             paused_s = "  [PAUSED]" if row.get("paused") else ""
+            mode_s = f"  mode={row.get('mode', 'supervised')}"
             self._worker_rows[wid]["info"].set(
                 f"[{row['connection']}] state={row['state']}  task={row['task'] or '—'}  "
-                f"branch={row['branch'] or '—'}{acct_s}{pair_s}{paused_s}{waiting}\n"
+                f"branch={row['branch'] or '—'}{acct_s}{pair_s}{paused_s}{mode_s}{waiting}\n"
                 f"files: {files or '—'}   last test: {row['last_test'] or '—'}   "
                 f"errors={row['errors']} retries={row['retries']}   last activity: {idle_s}"
                 + (f"   note: {row['note']}" if row["note"] else ""))
@@ -1390,9 +1511,49 @@ class BridgeApp:
             self._refresh()
             self._refresh_workers()
             self._refresh_accounts()
+            self._tick_count = getattr(self, "_tick_count", 0) + 1
+            if self._tick_count % 15 == 0:  # ~every 30s
+                self._watchdog()
         finally:
             if self.root.winfo_exists():
                 self.root.after(2000, self._tick)
+
+    def _w_backup(self) -> None:
+        """Configuration backup: zip the local JSON state (never secrets —
+        the bridge stores none)."""
+        import zipfile
+        path = filedialog.asksaveasfilename(
+            defaultextension=".zip", initialfile="muse-bridge-backup.zip",
+            title="Save configuration backup")
+        if not path:
+            return
+        data_dir = self.orch.settings.path.parent
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+            for p in sorted(data_dir.glob("*.json")):
+                z.write(p, p.name)
+        self.log.append("app", f"Configuration backed up to {path}")
+        messagebox.showinfo("Backup", f"Saved to:\n{path}")
+
+    def _w_restore(self) -> None:
+        import zipfile
+        path = filedialog.askopenfilename(
+            filetypes=[("ZIP backups", "*.zip")],
+            title="Restore configuration backup")
+        if not path:
+            return
+        if not messagebox.askyesno(
+                "Restore",
+                "Replace the current configuration with this backup?\n\n"
+                "The app will need a restart afterwards."):
+            return
+        data_dir = self.orch.settings.path.parent
+        with zipfile.ZipFile(path) as z:
+            for name in z.namelist():
+                if name.endswith(".json") and "/" not in name:
+                    z.extract(name, data_dir)
+        self.log.append("app", f"Configuration restored from {path}")
+        messagebox.showinfo("Restore",
+                            "Restored. Please restart Muse Bridge.")
 
     def _guidance(self) -> str:
         s = self.coord.tracker.state
