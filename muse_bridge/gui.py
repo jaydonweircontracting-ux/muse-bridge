@@ -10,12 +10,16 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 from pathlib import Path
+from typing import Callable
 
 from . import git_ops, muse_link
-from .hotkeys import DEFAULT_HOTKEYS, HotkeyManager
+from .hotkeys import (HotkeyBinding, HotkeyManager, find_conflict, vk_label)
+from .hotkey_config import (binding_for, load_bindings, reset_bindings,
+                            save_binding)
 from .orchestrator import Orchestrator
 from .profile import ProjectProfile
 from .run_control import RunController, RunState
@@ -243,21 +247,32 @@ class BridgeApp:
         self._run_dot.pack(side="left", padx=(0, 6))
         self._run_status = ttk.Label(bar, text="IDLE", width=34)
         self._run_status.pack(side="left")
-        self._run_btn = ttk.Button(bar, text="▶  START  (Ctrl+Shift+S)",
-                                   command=self._run_toggle, width=24)
+        self._run_btn = ttk.Button(bar, text="▶  START",
+                                   command=self._run_toggle, width=18)
         self._run_btn.pack(side="left", padx=8)
+        self._pause_btn = ttk.Button(bar, text="⏸  PAUSE",
+                                     command=self._run_pause_toggle, width=14)
+        self._pause_btn.pack(side="left")
         ttk.Button(bar, text="Tile windows",
-                   command=self._tile_worker_windows).pack(side="left")
-        ttk.Label(bar,
-                  text="Hotkeys: Ctrl+Shift+S start/stop · "
-                       "Ctrl+Shift+X stop now · Ctrl+Shift+1-5 focus worker",
-                  foreground="gray").pack(side="right", padx=8)
+                   command=self._tile_worker_windows).pack(side="left",
+                                                           padx=(8, 0))
+        ttk.Button(bar, text="Hotkeys…",
+                   command=self._show_hotkey_settings).pack(side="left",
+                                                            padx=(4, 0))
+        self._hotkey_hint = ttk.Label(bar, text="", foreground="gray")
+        self._hotkey_hint.pack(side="right", padx=8)
         self._refresh_run_bar()
         # Drive the run loop on the UI thread (schedule once).
         if not getattr(self, "_run_tick_scheduled", False):
             self._run_tick_scheduled = True
             self.root.after(int(self.run_ctl.tick_interval_s * 1000),
                             self._run_tick)
+
+    def _hk_label(self, name: str) -> str:
+        try:
+            return binding_for(self.settings, name).label
+        except Exception:
+            return "?"
 
     def _refresh_run_bar(self) -> None:
         # The bar may not exist yet (e.g. hotkey pressed during the
@@ -266,13 +281,25 @@ class BridgeApp:
             return
         st = self.run_ctl.state
         colors = {RunState.IDLE: "gray", RunState.RUNNING: "green",
-                  RunState.STOPPING: "orange"}
+                  RunState.PAUSED: "blue", RunState.STOPPING: "orange"}
         self._run_dot.delete("all")
-        self._run_dot.create_oval(2, 2, 12, 12, fill=colors[st], outline="")
+        self._run_dot.create_oval(2, 2, 12, 12,
+                                  fill=colors.get(st, "gray"), outline="")
         self._run_status.config(text=self.run_ctl.describe().upper())
+        go_label, stop_label, pause_label = (self._hk_label("run_toggle"),
+                                            self._hk_label("run_stop"),
+                                            self._hk_label("run_pause"))
         self._run_btn.config(
-            text=("⏹  STOP  (Ctrl+Shift+S)" if st == RunState.RUNNING
-                  else "▶  START  (Ctrl+Shift+S)"))
+            text=(f"⏹  STOP  ({stop_label})" if st == RunState.RUNNING
+                  else f"▶  START  ({go_label})"))
+        self._pause_btn.config(
+            text=(f"▶  RESUME  ({pause_label})" if st == RunState.PAUSED
+                  else f"⏸  PAUSE  ({pause_label})"),
+            state=("normal" if st in (RunState.RUNNING, RunState.PAUSED)
+                   else "disabled"))
+        self._hotkey_hint.config(
+            text=(f"{go_label} start · {stop_label} stop · "
+                  f"{pause_label} pause · Hotkeys… to reassign"))
 
     def _run_toggle(self) -> None:
         ok, msg = self.run_ctl.toggle()
@@ -301,26 +328,60 @@ class BridgeApp:
     # -- global hotkeys --------------------------------------------------------
 
     def _setup_hotkeys(self) -> None:
+        """Register the user's configured bindings (defaults: F1/F2/F3)."""
+        self._hk_last_fire: dict[str, float] = {}
         bound = 0
-        for spec in DEFAULT_HOTKEYS:
-            if spec.name == "toggle_run":
-                ok = self.hotkeys.register(spec, self._run_toggle)
-            elif spec.name == "stop_now":
-                ok = self.hotkeys.register(
-                    spec, lambda: self._hk_stop_now())
-            elif spec.name.startswith("focus_w"):
-                wid = "w" + spec.name[-1]
-                ok = self.hotkeys.register(
-                    spec, lambda w=wid: self._focus_worker(w))
-            else:
-                ok = False
-            bound += 1 if ok else 0
+        for binding in load_bindings(self.settings):
+            handler = self._hotkey_handler_for(binding.name)
+            if handler is None:
+                continue
+            # Debounce: holding the key must not re-trigger the action.
+            handler = self._debounced(binding.name, handler)
+            if self.hotkeys.register(binding, handler):
+                bound += 1
         if self.hotkeys.start():
-            self.log.append("app",
-                            f"Global hotkeys active ({bound} bound).")
+            self.log.append("app", f"Global hotkeys active ({bound} bound).")
         else:
             self.log.append("app",
                             "Global hotkeys unavailable on this platform.")
+
+    def _debounced(self, name: str,
+                   fn: Callable[[], None]) -> Callable[[], None]:
+        def wrapper() -> None:
+            now = time.time()
+            if now - self._hk_last_fire.get(name, 0.0) < 0.4:
+                return  # key repeat — ignore
+            self._hk_last_fire[name] = now
+            fn()
+        return wrapper
+
+    def _hotkey_handler_for(self, name: str) -> Callable[[], None] | None:
+        if name == "run_toggle":
+            return self._run_toggle
+        if name == "run_stop":
+            return self._run_toggle_stop_only
+        if name == "run_pause":
+            return self._run_pause_toggle
+        if name == "stop_now":
+            return self._hk_stop_now
+        if name.startswith("focus_w"):
+            wid = "w" + name[-1]
+            return lambda w=wid: self._focus_worker(w)
+        return None
+
+    def _run_toggle_stop_only(self) -> None:
+        # F2 means Stop (not toggle): only act when something is running.
+        if self.run_ctl.state in (RunState.RUNNING, RunState.PAUSED):
+            self._run_toggle()
+        else:
+            self.log.append("run", "Hotkey: nothing running to stop.")
+
+    def _run_pause_toggle(self) -> None:
+        ok, msg = self.run_ctl.toggle_pause()
+        self.log.append("run", "Hotkey: " + msg)
+        if not ok:
+            messagebox.showinfo("Run control", msg)
+        self._refresh_run_bar()
 
     def _hk_stop_now(self) -> None:
         ok, msg = self.run_ctl.force_stop()
@@ -328,6 +389,166 @@ class BridgeApp:
         self._refresh_run_bar()
         if not ok:
             messagebox.showinfo("Run control", msg)
+
+    # -- hotkey configuration (reassignable, persisted) ------------------------
+
+    def _show_hotkey_settings(self) -> None:
+        from .hotkeys import IS_WINDOWS
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Hotkeys")
+        dlg.transient(self.root)
+        dlg.grab_set()
+        ttk.Label(dlg,
+                  text=("Click Assign, then press any key. Esc cancels. "
+                        "Mouse clicks cannot be assigned.\n"
+                        "Run hotkeys control the run loop only — "
+                        "never individual workers."),
+                  foreground="gray").grid(row=0, column=0, columnspan=3,
+                                           padx=10, pady=(10, 6), sticky="w")
+        label_vars: dict[str, tk.StringVar] = {}
+
+        def rebuild_rows() -> None:
+            for w in dlg.grid_slaves():
+                if int(w.grid_info()["row"]) > 0:
+                    w.destroy()
+            for i, b in enumerate(load_bindings(self.settings), start=1):
+                ttk.Label(dlg, text=b.description).grid(
+                    row=i, column=0, padx=(10, 4), pady=3, sticky="w")
+                var = tk.StringVar(value=b.label)
+                label_vars[b.name] = var
+                ttk.Label(dlg, textvariable=var, width=20,
+                          font=("TkDefaultFont", 10, "bold")).grid(
+                              row=i, column=1, padx=4, pady=3)
+                ttk.Button(dlg, text="Assign…",
+                           command=lambda b=b: self._assign_hotkey(
+                               dlg, b, label_vars)).grid(
+                                   row=i, column=2, padx=(4, 10), pady=3)
+            n = len(load_bindings(self.settings)) + 1
+            ttk.Button(dlg, text="Reset to Defaults",
+                       command=lambda: self._reset_hotkeys(dlg)).grid(
+                           row=n, column=0, columnspan=3, pady=10)
+            if not IS_WINDOWS:
+                ttk.Label(dlg, text="Global hotkeys need Windows.",
+                          foreground="gray").grid(row=n + 1, column=0,
+                                                   columnspan=3, pady=(0, 8))
+
+        rebuild_rows()
+        self._hotkey_dialog_rebuild = rebuild_rows
+
+    def _reset_hotkeys(self, dlg) -> None:
+        reset_bindings(self.settings)
+        # Re-register everything from defaults.
+        for b in load_bindings(self.settings):
+            self._reregister_hotkey(b.name, quiet=True)
+        self.log.append("app", "Hotkeys reset to defaults.")
+        if hasattr(self, "_hotkey_dialog_rebuild"):
+            self._hotkey_dialog_rebuild()
+        self._refresh_run_bar()
+
+    def _reregister_hotkey(self, name: str, quiet: bool = False) -> bool:
+        from .hotkeys import IS_WINDOWS
+        binding = binding_for(self.settings, name)
+        handler = self._hotkey_handler_for(name)
+        if handler is None:
+            return False
+        self.hotkeys.unregister(name)
+        ok = self.hotkeys.register(binding, self._debounced(name, handler))
+        if not ok and IS_WINDOWS and not quiet:
+            messagebox.showwarning(
+                "Hotkey",
+                f"Could not register {binding.label} globally — it is "
+                f"reserved by Windows or taken by another app. "
+                f"Pick a different key.")
+        return ok
+
+    @staticmethod
+    def _keysym_to_vk(keysym: str) -> int | None:
+        """Map a tkinter keysym to a Win32 virtual-key code (None = reject)."""
+        if len(keysym) == 1:
+            ch = keysym.upper()
+            if "A" <= ch <= "Z" or "0" <= ch <= "9":
+                return ord(ch)
+        if keysym.startswith("F") and keysym[1:].isdigit():
+            n = int(keysym[1:])
+            if 1 <= n <= 24:
+                return 0x70 + n - 1
+        return {"space": 0x20, "Return": 0x0D, "Tab": 0x09,
+                "BackSpace": 0x08, "Delete": 0x2E, "Insert": 0x2D,
+                "Home": 0x24, "End": 0x23, "Prior": 0x21, "Next": 0x22,
+                "Up": 0x26, "Down": 0x28, "Left": 0x25,
+                "Right": 0x27}.get(keysym)
+
+    def _assign_hotkey(self, parent, binding: HotkeyBinding,
+                       label_vars: dict) -> None:
+        from .hotkeys import KeyCapture
+        # Unregister first: pressing the old key during capture must not
+        # fire the action.
+        self.hotkeys.unregister(binding.name)
+        cap = tk.Toplevel(parent)
+        cap.title(f"Assign: {binding.description}")
+        cap.transient(parent)
+        cap.grab_set()
+        ttk.Label(cap,
+                  text=("Press any keyboard key to assign.\n"
+                        "Esc cancels — mouse clicks are not assignable."),
+                  justify="center").pack(padx=24, pady=20)
+        capture = KeyCapture(self._keysym_to_vk)
+
+        def finish(mods: int, vk: int) -> None:
+            label = vk_label(mods, vk)
+            conflict = find_conflict(load_bindings(self.settings),
+                                     binding.name, mods, vk)
+            if conflict and not messagebox.askyesno(
+                    "Hotkey conflict",
+                    f"{label} is already assigned to "
+                    f"'{conflict.description}'.\n\nReplace it?"):
+                capture.held_mods.clear()
+                capture.pressed.clear()
+                capture.done = False
+                return  # keep waiting for another key
+            save_binding(self.settings, binding.name, mods, vk)
+            cap.destroy()
+            ok = self._reregister_hotkey(binding.name)
+            var = label_vars.get(binding.name)
+            if var is not None:
+                var.set(label if ok else label + " (not registered)")
+            self.log.append("app",
+                            f"Hotkey '{binding.description}' -> {label}.")
+            self._refresh_run_bar()
+
+        def on_key(ev) -> None:
+            outcome = capture.key(ev.keysym)
+            kind = outcome[0]
+            if kind == "cancel":
+                cap.destroy()
+                self._reregister_hotkey(binding.name, quiet=True)
+            elif kind == "rejected":
+                messagebox.showinfo("Hotkey",
+                                    f"'{outcome[1]}' cannot be assigned. "
+                                    f"Use a letter, digit, function key, "
+                                    f"or arrow/navigation key.")
+            elif kind == "assign":
+                finish(outcome[1], outcome[2])
+            # ("modifier",) and ("ignore",): keep waiting.
+
+        def on_key_release(ev) -> None:
+            capture.release(ev.keysym)
+
+        cap.bind("<KeyPress>", on_key)
+        cap.bind("<KeyRelease>", on_key_release)
+        # No mouse bindings at all: clicks can never be assigned.
+        def on_close() -> None:
+            if not capture.done:
+                fake_escape = type("E", (), {"keysym": "Escape"})()
+                on_key(fake_escape)
+        cap.protocol("WM_DELETE_WINDOW", on_close)
+
+        def _focus() -> None:
+            try:
+                cap.focus_force()
+            except Exception:
+                pass
+        cap.after(50, _focus)
 
     def _focus_worker(self, worker_id: str) -> None:
         try:

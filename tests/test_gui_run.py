@@ -131,7 +131,7 @@ class TestGuiRunControl(unittest.TestCase):
                         f"events: {events}")
 
         # Simulate the Ctrl+Shift+S hotkey exactly as the Win32 thread would.
-        handler = self.app.hotkeys._handlers.get("toggle_run")
+        handler = self.app.hotkeys._handlers.get("run_toggle")
         self.assertIsNotNone(handler)
         assert handler is not None
         handler()  # -> request_stop
@@ -172,6 +172,118 @@ class TestGuiRunControl(unittest.TestCase):
         self.root.update()
         self.assertTrue(self.infos, "expected an info dialog")
 
+    def test_pause_button_cycle(self) -> None:
+        from muse_bridge.run_control import RunState
+        self._verify_worker("w1")
+        # Pause disabled while idle.
+        self.assertEqual(str(self.app._pause_btn.cget("state")), "disabled")
+        self.app._run_btn.invoke()
+        self.root.update()
+        self.assertEqual(self.app.run_ctl.state, RunState.RUNNING)
+        self.assertEqual(str(self.app._pause_btn.cget("state")), "normal")
+        # Pause via the real button.
+        self.app._pause_btn.invoke()
+        self.root.update()
+        self.assertEqual(self.app.run_ctl.state, RunState.PAUSED)
+        self.assertIn("PAUSED", self.app._run_status.cget("text"))
+        self.assertIn("RESUME", self.app._pause_btn.cget("text"))
+        # Pause hotkey (F3 default) toggles back to running.
+        handler = self.app.hotkeys._handlers.get("run_pause")
+        self.assertIsNotNone(handler)
+        assert handler is not None
+        handler()
+        self.root.update()
+        self.assertEqual(self.app.run_ctl.state, RunState.RUNNING)
+
+    def test_hotkey_settings_dialog_lists_actions(self) -> None:
+        self.app._show_hotkey_settings()
+        self.root.update()
+        dialogs = [w for w in self.root.winfo_children()
+                   if type(w).__name__ == "Toplevel"]
+        self.assertTrue(dialogs, "settings dialog did not open")
+        dlg = dialogs[-1]
+        labels = [w.cget("text") for w in dlg.winfo_children()
+                  if type(w).__name__ == "Label"]
+        self.assertTrue(any("Start / Go" in t for t in labels), labels)
+        dlg.destroy()
+
+    def test_keysym_to_vk_mapping(self) -> None:
+        conv = self.app._keysym_to_vk
+        self.assertEqual(conv("F1"), 0x70)
+        self.assertEqual(conv("F3"), 0x72)
+        self.assertEqual(conv("a"), 0x41)
+        self.assertEqual(conv("5"), 0x35)
+        self.assertIsNone(conv("Shift_L"))   # modifiers not assignable alone
+        self.assertIsNone(conv("Control_L"))
+        self.assertIsNone(conv("weird_key_xyz"))
+
+    def _open_capture_dialog(self):
+        from muse_bridge.hotkey_config import binding_for
+        self.app._show_hotkey_settings()
+        self.root.update()
+        dlg = [w for w in self.root.winfo_children()
+               if type(w).__name__ == "Toplevel"][-1]
+        binding = binding_for(self.app.settings, "run_toggle")
+        self.app._assign_hotkey(dlg, binding, {})
+        self.root.update()
+        caps = [w for w in dlg.winfo_children()
+                if type(w).__name__ == "Toplevel"]
+        self.assertTrue(caps, "capture dialog did not open")
+        return dlg, caps[-1]
+
+    def test_capture_assigns_plain_key(self) -> None:
+        from muse_bridge.hotkeys import KeyCapture
+        cap = KeyCapture(self.app._keysym_to_vk)
+        self.assertEqual(cap.key("F5"), ("assign", 0, 0x74))
+
+    def test_capture_assigns_chord(self) -> None:
+        from muse_bridge.hotkeys import MOD_CONTROL, MOD_SHIFT, KeyCapture
+        cap = KeyCapture(self.app._keysym_to_vk)
+        self.assertEqual(cap.key("Control_L"), ("modifier",))
+        self.assertEqual(cap.key("Shift_L"), ("modifier",))
+        kind, mods, vk = cap.key("r")
+        self.assertEqual(kind, "assign")
+        self.assertEqual(mods, MOD_CONTROL | MOD_SHIFT)
+        self.assertEqual(vk, 0x52)
+
+    def test_capture_escape_cancels(self) -> None:
+        from muse_bridge.hotkeys import KeyCapture
+        cap = KeyCapture(self.app._keysym_to_vk)
+        self.assertEqual(cap.key("Escape"), ("cancel",))
+        self.assertEqual(cap.key("F1"), ("ignore",))  # finished
+
+    def test_capture_ignores_repeat_and_rejects_junk(self) -> None:
+        from muse_bridge.hotkeys import KeyCapture
+        cap = KeyCapture(self.app._keysym_to_vk)
+        self.assertEqual(cap.key("F1")[0], "assign")
+        cap2 = KeyCapture(self.app._keysym_to_vk)
+        cap2.key("F1")
+        # finish a fresh capture to test repeat on the same instance:
+        cap3 = KeyCapture(self.app._keysym_to_vk)
+        cap3.key("a")
+        self.assertEqual(cap3.key("a"), ("ignore",))
+        cap4 = KeyCapture(self.app._keysym_to_vk)
+        kind, ks = cap4.key("weird_key_xyz")
+        self.assertEqual(kind, "rejected")
+
+    def test_capture_release_clears_modifiers(self) -> None:
+        from muse_bridge.hotkeys import KeyCapture
+        cap = KeyCapture(self.app._keysym_to_vk)
+        cap.key("Control_L")
+        cap.release("Control_L")
+        kind, mods, vk = cap.key("r")
+        self.assertEqual((kind, mods), ("assign", 0))
+
+    def test_assignment_dialog_has_no_mouse_bindings(self) -> None:
+        # Mouse clicks can never be assigned: the capture dialog binds
+        # only keyboard events.
+        dlg, cap = self._open_capture_dialog()
+        for seq in ("<Button-1>", "<Button-2>", "<Button-3>",
+                    "<ButtonRelease-1>"):
+            self.assertEqual(cap.bind(seq), "",
+                             f"mouse binding {seq} must not exist")
+        dlg.destroy()
+
     def test_hotkey_during_wizard_does_not_crash(self) -> None:
         """Ctrl+Shift+S before the dashboard exists: no run bar yet, but the
         hotkey must not crash — start just reports no verified workers."""
@@ -186,7 +298,7 @@ class TestGuiRunControl(unittest.TestCase):
             app = BridgeApp(root)  # wizard showing, no dashboard/run bar
             root.update()
             self.assertFalse(hasattr(app, "_run_dot"))
-            handler = app.hotkeys._handlers.get("toggle_run")
+            handler = app.hotkeys._handlers.get("run_toggle")
             assert handler is not None
             handler()  # must not raise
             root.update()

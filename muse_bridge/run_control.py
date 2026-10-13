@@ -20,6 +20,7 @@ from typing import Callable
 class RunState(str, Enum):
     IDLE = "idle"
     RUNNING = "running"
+    PAUSED = "paused"
     STOPPING = "stopping"
 
 
@@ -64,11 +65,32 @@ class RunController:
 
     def request_stop(self) -> tuple[bool, str]:
         """Graceful stop: finish the current tick, then stand down."""
-        if self.state != RunState.RUNNING:
+        if self.state not in (RunState.RUNNING, RunState.PAUSED):
             return False, "No run in progress."
         self.state = RunState.STOPPING
         self._emit("Stop requested — finishing current tick.")
         return True, "Stopping after the current tick."
+
+    def request_pause(self) -> tuple[bool, str]:
+        """Pause the loop: no new scheduling until resumed. Workers keep
+        their states; in-flight handoffs are untouched."""
+        if self.state != RunState.RUNNING:
+            return False, "Nothing running to pause."
+        self.state = RunState.PAUSED
+        self._emit("Run paused.")
+        return True, "Paused. Press resume to continue."
+
+    def resume(self) -> tuple[bool, str]:
+        if self.state != RunState.PAUSED:
+            return False, "Run is not paused."
+        self.state = RunState.RUNNING
+        self._emit("Run resumed.")
+        return True, "Resumed."
+
+    def toggle_pause(self) -> tuple[bool, str]:
+        if self.state == RunState.PAUSED:
+            return self.resume()
+        return self.request_pause()
 
     def force_stop(self) -> tuple[bool, str]:
         """Immediate halt. State is persisted; handoffs keep their branches."""
@@ -91,6 +113,8 @@ class RunController:
         events: list[str] = []
         if self.state == RunState.IDLE:
             return events
+        if self.state == RunState.PAUSED:
+            return events  # loop halted; workers keep their states
         if self.state == RunState.STOPPING:
             self.state = RunState.IDLE
             self._persist()
@@ -196,6 +220,8 @@ class RunController:
     def describe(self) -> str:
         if self.state == RunState.RUNNING:
             return f"RUNNING (tick {self._ticks}, every {self.tick_interval_s:g}s)"
+        if self.state == RunState.PAUSED:
+            return f"PAUSED (tick {self._ticks} held)"
         if self.state == RunState.STOPPING:
             return "STOPPING — finishing current tick"
         return "IDLE"

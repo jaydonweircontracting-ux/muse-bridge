@@ -5,7 +5,10 @@ Run: python -m unittest discover -s tests
 
 import unittest
 
-from muse_bridge.hotkeys import DEFAULT_HOTKEYS, HotkeyManager
+from muse_bridge.hotkeys import (DEFAULT_HOTKEYS, MOD_CONTROL, MOD_SHIFT,
+                                 HotkeyManager, find_conflict, vk_label)
+from muse_bridge.hotkey_config import (binding_for, load_bindings,
+                                       reset_bindings, save_binding)
 from muse_bridge.run_control import RunController, RunState
 from muse_bridge import window_layout
 
@@ -147,6 +150,103 @@ class TestRunController(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(ctl.state, RunState.STOPPING)
 
+    def test_pause_resume_cycle(self) -> None:
+        orch = FakeOrchestrator(verified=1)
+        ctl = RunController(orch=orch)
+        # Can't pause when idle.
+        ok, _ = ctl.request_pause()
+        self.assertFalse(ok)
+        ctl.start()
+        ok, _ = ctl.request_pause()
+        self.assertTrue(ok)
+        self.assertEqual(ctl.state, RunState.PAUSED)
+        # Paused tick does no scheduling.
+        ctl.tick()
+        self.assertEqual(orch.schedule_calls, 0)
+        ok, _ = ctl.resume()
+        self.assertTrue(ok)
+        self.assertEqual(ctl.state, RunState.RUNNING)
+        ctl.tick()
+        self.assertEqual(orch.schedule_calls, 1)
+
+    def test_toggle_pause(self) -> None:
+        ctl = RunController(orch=FakeOrchestrator(verified=1))
+        ctl.start()
+        ok, _ = ctl.toggle_pause()
+        self.assertTrue(ok)
+        self.assertEqual(ctl.state, RunState.PAUSED)
+        ok, _ = ctl.toggle_pause()
+        self.assertTrue(ok)
+        self.assertEqual(ctl.state, RunState.RUNNING)
+
+    def test_stop_from_paused(self) -> None:
+        orch = FakeOrchestrator(verified=1)
+        ctl = RunController(orch=orch)
+        ctl.start()
+        ctl.request_pause()
+        ok, _ = ctl.request_stop()
+        self.assertTrue(ok)
+        self.assertEqual(ctl.state, RunState.STOPPING)
+        ctl.tick()
+        self.assertEqual(ctl.state, RunState.IDLE)
+
+    def test_no_auto_stop_while_paused(self) -> None:
+        # Paused with empty queue: tick is a no-op, must not auto-stop.
+        orch = FakeOrchestrator(verified=1)
+        ctl = RunController(orch=orch)
+        ctl.start()
+        ctl.request_pause()
+        ctl.tick()
+        self.assertEqual(ctl.state, RunState.PAUSED)
+
+
+class TestHotkeyConfig(unittest.TestCase):
+    def test_defaults_when_nothing_saved(self) -> None:
+        settings: dict = {}
+        class S:
+            def get(self, k, d=None):
+                return settings.get(k, d)
+            def set(self, k, v):
+                settings[k] = v
+        s = S()
+        bindings = load_bindings(s)
+        self.assertEqual(len(bindings), len(DEFAULT_HOTKEYS))
+        self.assertEqual(binding_for(s, "run_toggle").label, "F1")
+
+    def test_save_and_reload_override(self) -> None:
+        store: dict = {}
+        class S:
+            def get(self, k, d=None):
+                return store.get(k, d)
+            def set(self, k, v):
+                store[k] = v
+        s = S()
+        save_binding(s, "run_toggle", MOD_CONTROL, 0x52)  # Ctrl+R
+        b = binding_for(s, "run_toggle")
+        self.assertEqual(b.label, "Ctrl+R")
+        # Untouched actions keep defaults.
+        self.assertEqual(binding_for(s, "run_stop").label, "F2")
+
+    def test_reset_restores_defaults(self) -> None:
+        store: dict = {}
+        class S:
+            def get(self, k, d=None):
+                return store.get(k, d)
+            def set(self, k, v):
+                store[k] = v
+        s = S()
+        save_binding(s, "run_toggle", MOD_CONTROL, 0x52)
+        reset_bindings(s)
+        self.assertEqual(binding_for(s, "run_toggle").label, "F1")
+
+    def test_corrupt_saved_data_falls_back(self) -> None:
+        class S:
+            def get(self, k, d=None):
+                return {"hotkeys": {"run_toggle": "garbage"}}
+            def set(self, k, v):
+                pass
+        self.assertEqual(binding_for(S(), "run_toggle").label, "F1")
+
     def test_tick_auto_prepares_handoff(self) -> None:
         orch = FakeOrchestrator(verified=1)
         orch.next_report = {"assigned": [("task-1", "w1")], "blocked": []}
@@ -203,10 +303,34 @@ class TestRunController(unittest.TestCase):
 class TestHotkeys(unittest.TestCase):
     def test_default_bindings_present(self) -> None:
         names = {h.name for h in DEFAULT_HOTKEYS}
-        self.assertIn("toggle_run", names)
+        self.assertIn("run_toggle", names)
+        self.assertIn("run_stop", names)
+        self.assertIn("run_pause", names)
         self.assertIn("stop_now", names)
         for i in range(1, 6):
             self.assertIn(f"focus_w{i}", names)
+
+    def test_recorder_style_defaults(self) -> None:
+        by_name = {h.name: h for h in DEFAULT_HOTKEYS}
+        self.assertEqual(by_name["run_toggle"].label, "F1")
+        self.assertEqual(by_name["run_stop"].label, "F2")
+        self.assertEqual(by_name["run_pause"].label, "F3")
+
+    def test_vk_label(self) -> None:
+        self.assertEqual(vk_label(0, 0x70), "F1")
+        self.assertEqual(vk_label(0, 0x71), "F2")
+        self.assertEqual(vk_label(MOD_CONTROL | MOD_SHIFT, 0x58),
+                         "Ctrl+Shift+X")
+        self.assertEqual(vk_label(MOD_CONTROL | MOD_SHIFT, 0x31),
+                         "Ctrl+Shift+1")
+
+    def test_find_conflict(self) -> None:
+        bindings = list(DEFAULT_HOTKEYS)
+        clash = find_conflict(bindings, "run_stop", 0, 0x70)
+        self.assertIsNotNone(clash)
+        assert clash is not None
+        self.assertEqual(clash.name, "run_toggle")
+        self.assertIsNone(find_conflict(bindings, "run_stop", 0, 0x52))
 
     def test_non_windows_is_safe_noop(self) -> None:
         mgr = HotkeyManager()
@@ -218,6 +342,13 @@ class TestHotkeys(unittest.TestCase):
         finally:
             mgr.stop()
         self.assertFalse(mgr.active)
+
+    def test_unregister_is_safe(self) -> None:
+        mgr = HotkeyManager()
+        mgr.unregister("nope")  # must not raise
+        mgr.register(DEFAULT_HOTKEYS[0], lambda: None)
+        mgr.unregister(DEFAULT_HOTKEYS[0].name)
+        self.assertNotIn(DEFAULT_HOTKEYS[0].name, mgr._handlers)
 
 
 class TestWindowLayout(unittest.TestCase):
