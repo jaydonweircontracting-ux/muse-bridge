@@ -34,7 +34,9 @@ class FakeSlot:
         self.id = wid
         self.label = label
         self.window_title = window
+        self.chatgpt_window = ""
         self.account_id = account
+        self.paused = False
         self.state = state
         self.task_id = task
 
@@ -74,6 +76,8 @@ class TestRecoveryFile(unittest.TestCase):
         self.assertEqual(data["workers"]["w1"]["window"], "Win 1")
         self.assertEqual(data["workers"]["w1"]["account"], "acc-1")
         self.assertEqual(data["workers"]["w1"]["task"], "task-9")
+        self.assertIn("chatgpt_window", data["workers"]["w1"])
+        self.assertIn("paused", data["workers"]["w1"])
         self.assertEqual(data["last_checkpoint"]["commit"], "abc123")
         self.assertIn("how_to_reconnect", data)
 

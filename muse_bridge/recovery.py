@@ -56,7 +56,9 @@ def write_recovery(orch: Any, bridge_version: str = "1") -> Path:
             workers[s.id] = {
                 "label": s.label,
                 "window": s.window_title,
+                "chatgpt_window": s.chatgpt_window,
                 "account": s.account_id,
+                "paused": s.paused,
                 "state": s.state,
                 "task": s.task_id,
             }

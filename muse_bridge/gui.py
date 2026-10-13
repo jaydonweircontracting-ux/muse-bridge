@@ -670,6 +670,10 @@ class BridgeApp:
                    command=self._w_schedule).pack(side="left", padx=4)
         ttk.Button(top, text="SAFE SHUTDOWN",
                    command=self._w_safe_shutdown).pack(side="left", padx=4)
+        ttk.Button(top, text="DISCOVER WINDOWS",
+                   command=self._w_discover).pack(side="left", padx=4)
+        ttk.Button(top, text="VERIFY PAIRS",
+                   command=self._w_verify_pairs).pack(side="left", padx=4)
         ttk.Label(parent, wraplength=920, padding=(10, 2),
                   text="A worker is only real when its session is verified. "
                        "Slots without a verified session never receive tasks — "
@@ -687,7 +691,9 @@ class BridgeApp:
             wid = slot.id
             for label, cmd in [
                 ("Bind window", lambda w=wid: self._w_bind(w)),
+                ("Map ChatGPT", lambda w=wid: self._w_map_chatgpt(w)),
                 ("Verify session", lambda w=wid: self._w_verify(w)),
+                ("Pause/Resume", lambda w=wid: self._w_pause_toggle(w)),
                 ("Prepare handoff", lambda w=wid: self._w_handoff(w)),
                 ("Submitted", lambda w=wid: self._w_submitted(w)),
                 ("Done — confirm", lambda w=wid: self._w_done(w)),
@@ -739,6 +745,82 @@ class BridgeApp:
             messagebox.showinfo("Bind window",
                                 f"Bound. Now press 'Verify session' and follow the probe step.")
         self._refresh_workers()
+
+    def _w_discover(self) -> None:
+        """Discover Windows: list visible top-level windows for mapping.
+
+        Honest limit: Windows exposes top-level windows, not browser tabs.
+        Open each ChatGPT conversation in its own window for reliable
+        mapping — tabs inside one window cannot be enumerated without a
+        browser extension, which this edition deliberately avoids.
+        """
+        wins = muse_link.list_windows("")
+        if not wins:
+            messagebox.showinfo(
+                "Discover Windows",
+                "No windows found.\n\nOpen your Muse windows and ChatGPT "
+                "conversation windows first (one window per ChatGPT "
+                "conversation — tabs can't be listed without an extension).")
+            return
+        names = "\n".join(f"{i+1}. {w.title[:80]}" for i, w in enumerate(wins[:25]))
+        messagebox.showinfo(
+            "Discover Windows",
+            f"Found {len(wins)} window(s). Use 'Map ChatGPT' on a worker "
+            f"row to assign its conversation window.\n\n{names}")
+        self.log.append("app", f"Discovered {len(wins)} window(s).")
+
+    def _w_map_chatgpt(self, wid: str) -> None:
+        slot = self.orch.workers.get(wid)
+        if not slot:
+            return
+        wins = muse_link.list_windows("")
+        if not wins:
+            messagebox.showinfo("Map ChatGPT",
+                                "No windows found. Open the ChatGPT "
+                                "conversation window first.")
+            return
+        names = "\n".join(f"{i+1}. {w.title[:80]}" for i, w in enumerate(wins[:25]))
+        choice = _ask_choice(self.root, "Map ChatGPT conversation",
+                             f"Pick the dedicated ChatGPT conversation for "
+                             f"{slot.label}:\n\n{names}\n\nType the number "
+                             f"(0 to clear):",
+                             len(wins), allow_zero=True)
+        if choice is None:
+            return
+        title = "" if choice == -1 else wins[choice].title
+        self.orch.workers.map_chatgpt(wid, title)
+        self.log.append("app", f"{wid} ChatGPT -> '{title[:50]}'"
+                               if title else f"{wid} ChatGPT mapping cleared.")
+        self._refresh_workers()
+
+    def _w_pause_toggle(self, wid: str) -> None:
+        slot = self.orch.workers.get(wid)
+        if not slot:
+            return
+        paused = not slot.paused
+        self.orch.workers.set_paused(wid, paused)
+        self.log.append("app",
+                        f"{slot.label} {'paused' if paused else 'resumed'} "
+                        f"(excluded from scheduling while paused).")
+        self._refresh_workers()
+
+    def _w_verify_pairs(self) -> None:
+        """Harmless end-to-end mapping test: re-find every mapped window by
+        title and report. Verifies the mappings, not message automation."""
+        wins = {w.title for w in muse_link.list_windows("")}
+        lines = []
+        for s in self.orch.workers.slots:
+            muse_ok = bool(s.window_title) and s.window_title in wins
+            gpt_ok = bool(s.chatgpt_window) and s.chatgpt_window in wins
+            if not s.window_title and not s.chatgpt_window:
+                lines.append(f"{s.label}: nothing mapped — skipped")
+            else:
+                lines.append(
+                    f"{s.label}: Muse window "
+                    f"{'FOUND' if muse_ok else 'MISSING'}; ChatGPT "
+                    f"{'FOUND' if gpt_ok else 'MISSING'}")
+        self.log.append("app", "Verify pairs: " + " | ".join(lines))
+        messagebox.showinfo("Verify pairs", "\n".join(lines))
 
     def _w_verify(self, wid: str) -> None:
         slot = self.orch.workers.get(wid)
@@ -841,9 +923,12 @@ class BridgeApp:
             files = ", ".join(row["files"][:4]) + ("…" if len(row["files"]) > 4 else "")
             acct = row.get("account_label", "")
             acct_s = f"  account={acct} ({row.get('account_status','')})" if acct else "  account=—"
+            pair = row.get("chatgpt_window", "")
+            pair_s = f"  chatgpt={'«' + pair[:40] + '»' if pair else '—'}"
+            paused_s = "  [PAUSED]" if row.get("paused") else ""
             self._worker_rows[wid]["info"].set(
                 f"[{row['connection']}] state={row['state']}  task={row['task'] or '—'}  "
-                f"branch={row['branch'] or '—'}{acct_s}{waiting}\n"
+                f"branch={row['branch'] or '—'}{acct_s}{pair_s}{paused_s}{waiting}\n"
                 f"files: {files or '—'}   last test: {row['last_test'] or '—'}   "
                 f"errors={row['errors']} retries={row['retries']}   last activity: {idle_s}"
                 + (f"   note: {row['note']}" if row["note"] else ""))
@@ -1395,8 +1480,10 @@ def _ask_text(root: tk.Tk, title: str, prompt: str) -> str | None:
     return result["v"]
 
 
-def _ask_choice(root: tk.Tk, title: str, prompt: str, n: int) -> int | None:
-    """Tiny numbered-choice dialog. Returns 0-based index or None."""
+def _ask_choice(root: tk.Tk, title: str, prompt: str, n: int,
+                allow_zero: bool = False) -> int | None:
+    """Tiny numbered-choice dialog. Returns 0-based index, -1 for 'clear'
+    when allow_zero is set, or None on cancel/invalid."""
     result: dict[str, int | None] = {"v": None}
     win = tk.Toplevel(root)
     win.title(title)
@@ -1408,7 +1495,10 @@ def _ask_choice(root: tk.Tk, title: str, prompt: str, n: int) -> int | None:
     def ok() -> None:
         try:
             i = int(var.get().strip()) - 1
-            result["v"] = i if 0 <= i < n else None
+            if allow_zero and i == -1:
+                result["v"] = -1
+            else:
+                result["v"] = i if 0 <= i < n else None
         except ValueError:
             result["v"] = None
         win.destroy()

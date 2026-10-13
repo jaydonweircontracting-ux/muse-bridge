@@ -201,6 +201,16 @@ Up to five Muse workers collaborate on the **same** Adventure Game V2 repo:
   only verified facts update it.
 - **Recovery & isolation.** All state persists; restarting restores workers,
   queue, and ownership. Disconnecting one account never touches the others.
+- **Worker↔ChatGPT pairs.** Each slot maps to its dedicated ChatGPT
+  conversation window (**Map ChatGPT**; **Discover Windows** lists what's
+  open — one window per conversation, since tabs can't be enumerated
+  without a browser extension). Mappings persist, appear in
+  `recovery.json`, and **Verify pairs** re-finds every mapped window by
+  title. Message exchange itself stays user-confirmed copy/paste — the
+  bridge never types into or reads those windows on its own.
+- **Per-worker pause.** **Pause/Resume** on a worker row excludes that slot
+  from scheduling (it keeps its state, branch, and task); the run loop's
+  F1/F2/F3 control the loop only, never individual workers.
 
 ## Verification status
 

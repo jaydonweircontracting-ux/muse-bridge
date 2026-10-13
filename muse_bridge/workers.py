@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -61,7 +61,9 @@ class WorkerSlot:
     label: str                   # "Muse 1" (user-editable)
     role: str                    # configurable role
     window_title: str = ""       # bound Muse window/session
+    chatgpt_window: str = ""     # mapped ChatGPT conversation window
     account_id: str = ""         # linked account (BUILD 2)
+    paused: bool = False         # excluded from scheduling while paused
     state: str = WorkerState.OFFLINE.value
     session_verified: bool = False
     verified_at: float = 0.0
@@ -80,6 +82,7 @@ class WorkerSlot:
 
     def available(self) -> bool:
         return (self.session_verified
+                and not self.paused
                 and WorkerState(self.state) == WorkerState.READY)
 
 
@@ -95,10 +98,14 @@ class WorkerManager:
     def _load(self) -> list[WorkerSlot]:
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
+            # Field-tolerant: old files lack newer fields (chatgpt_window,
+            # paused) — load with defaults instead of dropping the slot.
+            known = {f.name for f in fields(WorkerSlot)}
             slots = []
             for r in raw:
                 try:
-                    slots.append(WorkerSlot(**r))
+                    slots.append(WorkerSlot(
+                        **{k: v for k, v in r.items() if k in known}))
                 except TypeError:
                     continue
             if slots:
@@ -132,7 +139,8 @@ class WorkerManager:
         return None
 
     def verified_count(self) -> int:
-        return sum(1 for s in self.slots if s.session_verified)
+        return sum(1 for s in self.slots
+                   if s.session_verified and not s.paused)
 
     def concurrency_limit(self) -> int:
         """Real verified sessions, capped at 5. This is the honest limit."""
@@ -167,6 +175,25 @@ class WorkerManager:
         s.verified_at = 0.0
         if WorkerState(s.state) == WorkerState.OFFLINE:
             s.state = WorkerState.READY.value  # bound but unverified != verified
+        self.save()
+        return True
+
+    def map_chatgpt(self, worker_id: str, window_title: str) -> bool:
+        """Map a worker to its dedicated ChatGPT conversation window."""
+        s = self.get(worker_id)
+        if not s:
+            return False
+        s.chatgpt_window = window_title
+        self.save()
+        return True
+
+    def set_paused(self, worker_id: str, paused: bool) -> bool:
+        """Pause/resume a single worker. Paused workers are excluded from
+        scheduling but keep their state, branch, and task."""
+        s = self.get(worker_id)
+        if not s:
+            return False
+        s.paused = paused
         self.save()
         return True
 
@@ -231,6 +258,7 @@ class WorkerManager:
                 "connection": ("verified" if s.session_verified
                                else ("bound" if s.window_title else "offline")),
                 "state": s.state, "task": s.task_id,
+                "paused": s.paused, "chatgpt_window": s.chatgpt_window,
                 "workspace": s.workspace, "branch": s.branch,
                 "files": list(s.expected_files),
                 "waiting_for_user": s.state == WorkerState.WAITING_FOR_USER.value,

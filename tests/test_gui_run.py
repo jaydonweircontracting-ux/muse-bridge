@@ -284,6 +284,48 @@ class TestGuiRunControl(unittest.TestCase):
                              f"mouse binding {seq} must not exist")
         dlg.destroy()
 
+    def test_worker_pause_toggle(self) -> None:
+        self._verify_worker("w1")
+        slot = self.app.orch.workers.get("w1")
+        assert slot is not None
+        self.app._w_pause_toggle("w1")
+        self.assertTrue(slot.paused)
+        self.assertFalse(slot.available())
+        self.app._w_pause_toggle("w1")
+        self.assertFalse(slot.paused)
+        self.assertTrue(slot.available())
+
+    def test_verify_pairs_no_windows(self) -> None:
+        # Off Windows there are no windows: must report gracefully.
+        self._verify_worker("w1")
+        self.app._w_verify_pairs()
+        self.root.update()
+        self.assertTrue(any("MISSING" in i for i in self.infos), self.infos)
+
+    def test_map_chatgpt_assigns_window(self) -> None:
+        import muse_bridge.gui as gui_mod
+        from muse_bridge import muse_link
+        orig_ask = gui_mod._ask_choice
+        orig_list = muse_link.list_windows
+        try:
+            muse_link.list_windows = lambda substring="": [
+                muse_link.WindowInfo(title="ChatGPT - convo A")]
+            gui_mod._ask_choice = lambda *a, **k: 0
+            self.app._w_map_chatgpt("w1")
+            slot = self.app.orch.workers.get("w1")
+            assert slot is not None
+            self.assertEqual(slot.chatgpt_window, "ChatGPT - convo A")
+            # Persisted across reload.
+            from muse_bridge.workers import WorkerManager
+            from muse_bridge.store import data_dir
+            wm2 = WorkerManager(data_dir())
+            assert wm2.get("w1") is not None
+            self.assertEqual(wm2.get("w1").chatgpt_window,
+                             "ChatGPT - convo A")
+        finally:
+            gui_mod._ask_choice = orig_ask
+            muse_link.list_windows = orig_list
+
     def test_hotkey_during_wizard_does_not_crash(self) -> None:
         """Ctrl+Shift+S before the dashboard exists: no run bar yet, but the
         hotkey must not crash — start just reports no verified workers."""

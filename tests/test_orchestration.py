@@ -96,6 +96,46 @@ class TestWorkerVerification(unittest.TestCase):
         self.assertEqual(wm.verified_count(), 2)
         self.assertEqual(wm.concurrency_limit(), 2)
 
+    def test_paused_worker_not_available(self) -> None:
+        d = tmpdir()
+        wm = WorkerManager(d)
+        wm.bind_session("w1", "win")
+        wm.verify_session("w1", "Muse 1 is live")
+        self.assertTrue(wm.get("w1").available())
+        self.assertTrue(wm.set_paused("w1", True))
+        self.assertFalse(wm.get("w1").available())
+        self.assertEqual(wm.verified_count(), 0)
+        self.assertTrue(wm.set_paused("w1", False))
+        self.assertTrue(wm.get("w1").available())
+
+    def test_old_workers_json_loads_with_new_fields(self) -> None:
+        import json
+        d = tmpdir()
+        # Simulate a workers.json written before chatgpt_window/paused existed.
+        old = [{"id": "w1", "label": "Muse 1", "role": "world",
+                "window_title": "win", "account_id": "",
+                "state": "READY", "session_verified": True,
+                "verified_at": 0.0, "task_id": "", "workspace": "",
+                "branch": "", "expected_files": [], "last_activity": 0.0,
+                "last_test_result": "", "errors": 0, "retries": 0, "note": ""}]
+        (d / "workers.json").write_text(json.dumps(old), encoding="utf-8")
+        wm = WorkerManager(d)
+        s = wm.get("w1")
+        assert s is not None
+        self.assertEqual(s.window_title, "win")
+        self.assertEqual(s.chatgpt_window, "")
+        self.assertFalse(s.paused)
+
+    def test_map_chatgpt_persists(self) -> None:
+        d = tmpdir()
+        wm = WorkerManager(d)
+        self.assertTrue(wm.map_chatgpt("w1", "ChatGPT - convo 3"))
+        self.assertEqual(wm.get("w1").chatgpt_window, "ChatGPT - convo 3")
+        wm2 = WorkerManager(d)
+        self.assertEqual(wm2.get("w1").chatgpt_window, "ChatGPT - convo 3")
+        self.assertTrue(wm2.map_chatgpt("w1", ""))
+        self.assertEqual(wm2.get("w1").chatgpt_window, "")
+
 
 class TestScheduler(unittest.TestCase):
     def test_assigns_up_to_verified_limit(self) -> None:
@@ -110,6 +150,18 @@ class TestScheduler(unittest.TestCase):
         self.assertEqual(len(report["assigned"]), 2)
         self.assertEqual(len(report["blocked"]), 2)
         self.assertIn("concurrency limit", report["blocked"][0]["reason"])
+
+    def test_paused_workers_are_skipped(self) -> None:
+        d = tmpdir()
+        o = make_orch(d, fixture_repo())
+        verify(o, "w1")
+        verify(o, "w2")
+        o.workers.set_paused("w1", True)
+        o.queue.add(Task(id="t0", title="task 0", priority=5,
+                         expected_files=["src/f0.ts"]))
+        report = o.schedule()
+        self.assertEqual(len(report["assigned"]), 1)
+        self.assertEqual(report["assigned"][0][1], "w2")
 
     def test_dependencies_gate_scheduling(self) -> None:
         d = tmpdir()
