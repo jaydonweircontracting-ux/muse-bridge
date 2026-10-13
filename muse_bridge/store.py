@@ -232,3 +232,6 @@ class Checkpoints:
     def latest(self) -> dict[str, Any] | None:
         items: list[dict[str, Any]] = _read_json(self.path, [])
         return items[-1] if items else None
+
+    def all(self) -> list[dict[str, Any]]:
+        return _read_json(self.path, [])

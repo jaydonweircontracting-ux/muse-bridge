@@ -45,6 +45,25 @@ def work_area() -> tuple[int, int, int, int]:
         return (0, 0, 0, 0)
 
 
+def grid_layout(n: int, width: int, height: int,
+                left: int = 0, top: int = 0) -> list[tuple[int, int, int, int]]:
+    """Pure grid math: n rectangles over (left, top, width, height).
+
+    Returns [(x, y, w, h), ...]. Separated so the layout is unit-testable
+    without Windows or real windows.
+    """
+    if n <= 0 or width <= 0 or height <= 0:
+        return []
+    cols = 3 if n > 4 else 2 if n > 1 else 1
+    rows = (n + cols - 1) // cols
+    cw, ch = width // cols, height // rows
+    rects = []
+    for i in range(n):
+        r, c = divmod(i, cols)
+        rects.append((left + c * cw, top + r * ch, cw, ch))
+    return rects
+
+
 def tile_windows(titles: list[str]) -> tuple[int, str]:
     """Arrange the given windows (exact titles) in a grid.
 
@@ -65,17 +84,14 @@ def tile_windows(titles: list[str]) -> tuple[int, str]:
         if not wins:
             return 0, "No bound worker windows found."
         left, top, width, height = work_area()
-        n = len(wins)
-        cols = 3 if n > 4 else 2 if n > 1 else 1
-        rows = (n + cols - 1) // cols
-        cw, ch = width // cols, height // rows
-        for i, w in enumerate(wins):
-            r, c = divmod(i, cols)
+        rects = grid_layout(len(wins), width, height, left, top)
+        for w, (x, y, cw, ch) in zip(wins, rects):
             try:
-                w.move_window(left + c * cw, top + r * ch, cw, ch,
-                              repaint=True)
+                w.move_window(x, y, cw, ch, repaint=True)
             except Exception:
                 continue
+        cols = 3 if len(wins) > 4 else 2 if len(wins) > 1 else 1
+        rows = (len(wins) + cols - 1) // cols
         return len(wins), f"Tiled {len(wins)} window(s) in a {cols}x{rows} grid."
     except Exception as exc:
         return 0, f"Tiling failed: {exc}"
