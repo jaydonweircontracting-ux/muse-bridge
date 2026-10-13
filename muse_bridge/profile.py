@@ -14,6 +14,20 @@ from pathlib import Path
 PROFILE_VERSION = 1
 
 
+# Authoritative constraints every worker must respect. Updated only with
+# verified facts — never invented.
+ARCHITECTURE_CONSTRAINTS = [
+    "React + Vite + TypeScript; GitHub Pages deployment; no backend.",
+    "2.5D isometric renderer is the default view; 2D is the Settings fallback.",
+    "Single grid/chunk coordinate system — never introduce a second one.",
+    "World generation is deterministic from the world seed.",
+    "NPC identities, quests, dialogue, saves, roads, authored locations preserved.",
+    "Save schema is versioned; old saves must migrate, never be invalidated.",
+    "Entities persist in saves: spawn-code changes must also handle save restore.",
+    "No broad rewrites or replacement architecture without explicit approval.",
+]
+
+
 def scan_repo(repo: Path) -> dict:
     """Read real facts from the game repository. No invention."""
     facts: dict = {"path": str(repo), "detected": {}}
@@ -101,6 +115,12 @@ class ProjectProfile:
             "next_priority": "",
             "completed": [],
             "failed": [],
+            # --- shared game memory (all workers read this) ---
+            "architecture_constraints": list(ARCHITECTURE_CONSTRAINTS),
+            "decision_log": [],        # {"at", "decision", "reason", "by"}
+            "module_index": {},        # {"path": "one-line purpose"}
+            "build_number": "",
+            "current_commit": "",
         }
 
     def save(self, data: dict) -> None:
@@ -158,3 +178,49 @@ class ProjectProfile:
         if next_priority:
             data["next_priority"] = next_priority
         self.save(data)
+
+    # --- shared game memory -------------------------------------------
+    def log_decision(self, decision: str, reason: str = "",
+                     by: str = "bridge") -> None:
+        """Record an architectural decision. Verified facts only."""
+        data = self.load()
+        data["decision_log"].append({
+            "at": time.time(), "decision": decision,
+            "reason": reason, "by": by,
+        })
+        self.save(data)
+
+    def set_module_index(self, index: dict[str, str]) -> None:
+        data = self.load()
+        data["module_index"] = index
+        self.save(data)
+
+    def record_build(self, build_number: str, commit: str) -> None:
+        data = self.load()
+        data["build_number"] = build_number
+        data["current_commit"] = commit
+        self.save(data)
+
+    def worker_briefing(self) -> str:
+        """The authoritative briefing every worker reads before coding."""
+        data = self.load()
+        lines = [
+            "AUTHORITATIVE GAME BRIEF (read before changing code):",
+            "",
+            "Architecture constraints:",
+            *[f"  - {c}" for c in data.get("architecture_constraints", [])],
+            "",
+            f"Project summary: {data.get('project_summary', '(none)')}",
+            f"Next priority: {data.get('next_priority', '(none)')}",
+        ]
+        if data.get("decision_log"):
+            lines.append("")
+            lines.append("Key decisions:")
+            for d in data["decision_log"][-8:]:
+                lines.append(f"  - {d['decision']} ({d.get('reason', '')})")
+        if data.get("module_index"):
+            lines.append("")
+            lines.append("Module index (purpose per file):")
+            for path, purpose in list(data["module_index"].items())[:20]:
+                lines.append(f"  - {path}: {purpose}")
+        return "\n".join(lines)

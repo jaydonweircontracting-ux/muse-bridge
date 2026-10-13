@@ -97,6 +97,21 @@ class Task:
     attempts: int = 0
     evidence: dict[str, Any] = field(default_factory=dict)
     notes: str = ""
+    # --- orchestration fields ---
+    owner: str = ""                    # worker id, e.g. "w2"
+    deps: list[str] = field(default_factory=list)   # task ids that must complete first
+    expected_files: list[str] = field(default_factory=list)
+    priority: int = 5                  # 1 (highest) .. 10
+    workspace: str = ""                # worktree path
+    branch: str = ""                   # worker branch
+    verification: dict[str, Any] = field(default_factory=dict)
+
+    def deps_met(self, queue: "TaskQueue") -> bool:
+        for d in self.deps:
+            t = queue.get(d)
+            if t is None or t.status != "completed":
+                return False
+        return True
 
 
 class TaskQueue:

@@ -61,23 +61,62 @@ main.py                  Entry point
 muse_bridge/
   state.py               Explicit handoff states; illegal transitions rejected
   handoff.py             Prompt builders, TASK-line parser, <TAG> extraction
-  runner.py              Headless handoff coordinator (unit-tested)
+  runner.py              Headless single-handoff coordinator (unit-tested)
+  orchestrator.py        Multi-worker engine: schedule, handoff, integrate
+  workers.py             5 worker slots; verified sessions only, never simulated
+  workspaces.py          Git worktree isolation per worker (branch fallback)
+  ownership.py           File ownership registry + conflict detection
+  scheduler.py           Dependency-aware assignment, honest concurrency limit
+  integrate.py           Integration gate: evidence-based merge into bridge/integration
   store.py               JSON persistence: settings, queue, brief, log, checkpoints
-  profile.py             RPG project profile; repo facts READ from your files
+  profile.py             Shared game memory: brief, constraints, decisions, module index
   muse_link.py           Window listing + focus (pywinauto); no scraping, no guessing
   chatgpt.py             Manual-relay coordination (no API in this edition)
   git_ops.py             Safe git reads, diff scan, local test/build runner
-  gui.py                 Tkinter wizard + control panel
+  gui.py                 Tkinter wizard + control panel (Handoffs + Workers tabs)
 tests/test_core.py       19 unit tests (python -m unittest discover -s tests)
-scripts/acceptance_walkthrough.py   25-check end-to-end walkthrough (25/25 pass)
+tests/test_orchestration.py  14 orchestration tests
+scripts/acceptance_walkthrough.py      25-check handoff cycle (25/25 pass)
+scripts/acceptance_orchestration.py    19-check multi-worker cycle (19/19 pass)
 build_windows.bat        The single packaging step (run on Windows)
 ```
 
+## Multi-worker orchestration (Workers tab)
+
+Up to five Muse workers collaborate on the **same** Adventure Game V2 repo:
+
+- **Real sessions only.** Each of the 5 slots (Muse 1–5, configurable roles)
+  binds a Muse window and is verified with a probe prompt whose reply must
+  contain the slot's label. The dashboard shows "N/5 sessions verified" and
+  the scheduler never exceeds that count — with fewer sessions, work queues
+  instead of pretending to run in parallel.
+- **Isolated workspaces.** Each assigned worker gets its own Git worktree on
+  its own branch (`bridge/w1/<task>`). Workers cannot overwrite each other;
+  the main checkout is never touched by workers.
+- **File ownership.** Tasks declare expected files; overlapping claims block
+  assignment. Core files (App.tsx, package.json, …) are exclusive.
+- **Dependency-aware scheduling.** Tasks wait for prerequisites; priorities
+  order the queue.
+- **Integration gate.** Before merging: diff inspection, ownership/overlap
+  check, tests + typecheck + production build in the worker's workspace,
+  then merge into the single `bridge/integration` branch. Failed gates roll
+  back the integration branch and preserve the worker's branch — failed
+  tests can never be marked passed.
+- **Shared game memory.** One authoritative brief, architecture constraints,
+  decision log, and module index — every worker reads it before coding, and
+  only verified facts update it.
+- **Recovery & isolation.** All state persists; restarting restores workers,
+  queue, and ownership. Disconnecting one account never touches the others.
+
 ## Verification status
 
-- 19/19 unit tests pass (states, parsing, no-duplicate guard, recovery).
-- 25/25 acceptance-walkthrough checks pass: full plan→dev→verify→review→
+- 33/33 unit tests pass (handoff engine + orchestration engine).
+- 25/25 handoff acceptance checks pass: full plan→dev→verify→review→
   checkpoint cycle plus close/reopen recovery, against a fixture repo.
+- 19/19 orchestration acceptance checks pass: two concurrent tasks in
+  separate worktrees, conflict blocking, evidence-based integration,
+  failed-test merge block with worker branch preserved, restart recovery,
+  honest 2/5 concurrency reporting.
 - The Windows EXE itself is **not yet built** — this environment is Linux and
   PyInstaller only builds for its host OS. Run `build_windows.bat` on a
   Windows PC for the one remaining packaging step, then use the wizard's

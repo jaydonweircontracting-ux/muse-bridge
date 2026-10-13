@@ -15,10 +15,12 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 from pathlib import Path
 
 from . import git_ops, muse_link
+from .orchestrator import Orchestrator
 from .profile import ProjectProfile
 from .runner import Coordinator, StepResult
 from .state import HandoffState
 from .store import Brief, Checkpoints, EventLog, Settings, TaskQueue
+from .workers import WorkerState
 
 
 def _open_path(path: str) -> None:
@@ -47,20 +49,13 @@ class BridgeApp:
         self.coord = Coordinator(self.settings, self.log, self.queue,
                                  self.checkpoints, self.brief, self.profile)
         self.coord.copy_text = self._copy
+        self.orch = Orchestrator()
+        self.orch.focus_window = muse_link.focus_window
+        self.orch.copy_text = self._copy
         if not self.settings.get("first_run_complete"):
             self.show_wizard()
         else:
             self.show_dashboard()
-            # Restart recovery: tell the user what was happening.
-            st = self.coord.tracker.state
-            if st not in (HandoffState.READY, HandoffState.STOPPED):
-                self.log.append("app", "Recovered after restart: " + self.coord.describe_status().replace("\n", " | "))
-                messagebox.showinfo(
-                    "Recovered after restart",
-                    "Muse Bridge restored your saved state:\n\n"
-                    + self.coord.describe_status()
-                    + "\n\nNothing was lost. Press NEXT HANDOFF to continue, "
-                      "or STOP to stand down.")
 
     # -- helpers -------------------------------------------------------------
     def _copy(self, text: str) -> None:
@@ -193,19 +188,39 @@ class BridgeApp:
     # -- dashboard ---------------------------------------------------------------
     def show_dashboard(self) -> None:
         self._clear()
-        top = ttk.Frame(self.root, padding=10); top.pack(fill="x")
+        nb = ttk.Notebook(self.root)
+        nb.pack(fill="both", expand=True)
+        hf = ttk.Frame(nb)
+        wf = ttk.Frame(nb)
+        nb.add(hf, text="Handoffs")
+        nb.add(wf, text="Workers (1–5)")
+        self._build_handoff_tab(hf)
+        self._build_workers_tab(wf)
+        # Restart recovery: tell the user what was happening.
+        st = self.coord.tracker.state
+        if st not in (HandoffState.READY, HandoffState.STOPPED):
+            self.log.append("app", "Recovered after restart: " + self.coord.describe_status().replace("\n", " | "))
+            messagebox.showinfo(
+                "Recovered after restart",
+                "Muse Bridge restored your saved state:\n\n"
+                + self.coord.describe_status()
+                + "\n\nNothing was lost. Press NEXT HANDOFF to continue, "
+                  "or STOP to stand down.")
+
+    def _build_handoff_tab(self, parent) -> None:
+        top = ttk.Frame(parent, padding=10); top.pack(fill="x")
         ttk.Label(top, text="Muse Bridge",
                   font=("TkDefaultFont", 14, "bold")).pack(side="left")
         self._state_lbl = ttk.Label(top, text="READY",
                                     font=("TkDefaultFont", 12, "bold"))
         self._state_lbl.pack(side="left", padx=20)
 
-        self._next_action = ttk.Label(self.root, text="", wraplength=920,
+        self._next_action = ttk.Label(parent, text="", wraplength=920,
                                       font=("TkDefaultFont", 10, "bold"),
                                       foreground="navy", padding=(10, 4))
         self._next_action.pack(fill="x")
 
-        btns = ttk.Frame(self.root, padding=8); btns.pack(fill="x")
+        btns = ttk.Frame(parent, padding=8); btns.pack(fill="x")
         buttons = [
             ("START", self._start, 0, 0), ("PAUSE", self._pause, 0, 1),
             ("RESUME", self._resume, 0, 2), ("STOP", self._stop, 0, 3),
@@ -224,7 +239,7 @@ class BridgeApp:
                 row=r, column=c, padx=4, pady=3)
 
         # Muse progress confirmations (explicit — never guessed)
-        prog = ttk.LabelFrame(self.root, text="Muse progress (you confirm — never guessed)",
+        prog = ttk.LabelFrame(parent, text="Muse progress (you confirm — never guessed)",
                               padding=8)
         prog.pack(fill="x", padx=10, pady=4)
         ttk.Button(prog, text="MUSE TASK SUBMITTED",
@@ -235,7 +250,7 @@ class BridgeApp:
                    command=self._run_verify).pack(side="left", padx=4)
 
         # Response transfer
-        tr = ttk.LabelFrame(self.root, text="Transfer a response (paste, don't retype)",
+        tr = ttk.LabelFrame(parent, text="Transfer a response (paste, don't retype)",
                             padding=8)
         tr.pack(fill="x", padx=10, pady=4)
         self._transfer = scrolledtext.ScrolledText(tr, height=4)
@@ -243,7 +258,7 @@ class BridgeApp:
         ttk.Button(tr, text="SAVE TRANSFERRED RESPONSE",
                    command=self._save_transfer).pack(anchor="e")
 
-        info = ttk.Frame(self.root, padding=(10, 4)); info.pack(fill="x")
+        info = ttk.Frame(parent, padding=(10, 4)); info.pack(fill="x")
         self._info_vars: dict[str, tk.StringVar] = {}
         for key in ["Current task", "Current handoff", "Waiting on",
                     "Last completed", "Queue", "Saved progress"]:
@@ -253,12 +268,200 @@ class BridgeApp:
             ttk.Label(info, textvariable=v, wraplength=700).grid(
                 row=list(self._info_vars).index(key), column=1, sticky="w")
 
-        ttk.Label(self.root, text="Log", padding=(10, 0)).pack(anchor="w")
-        self._log_view = scrolledtext.ScrolledText(self.root, height=10,
+        ttk.Label(parent, text="Log", padding=(10, 0)).pack(anchor="w")
+        self._log_view = scrolledtext.ScrolledText(parent, height=10,
                                                    state="disabled")
         self._log_view.pack(fill="both", expand=True, padx=10, pady=(0, 10))
         self._refresh()
         self.root.after(2000, self._tick)
+
+    # -- workers tab ---------------------------------------------------------------
+    def _build_workers_tab(self, parent) -> None:
+        top = ttk.Frame(parent, padding=10); top.pack(fill="x")
+        ttk.Label(top, text="Worker orchestration",
+                  font=("TkDefaultFont", 12, "bold")).pack(side="left")
+        self._sess_lbl = ttk.Label(top, text="", font=("TkDefaultFont", 10, "bold"))
+        self._sess_lbl.pack(side="left", padx=16)
+        ttk.Button(top, text="SCHEDULE WORK",
+                   command=self._w_schedule).pack(side="left", padx=4)
+        ttk.Button(top, text="SAFE SHUTDOWN",
+                   command=self._w_safe_shutdown).pack(side="left", padx=4)
+        ttk.Label(parent, wraplength=920, padding=(10, 2),
+                  text="A worker is only real when its session is verified. "
+                       "Slots without a verified session never receive tasks — "
+                       "the remaining work stays queued.").pack(fill="x")
+
+        self._worker_rows: dict[str, dict] = {}
+        for slot in self.orch.workers.slots:
+            fr = ttk.LabelFrame(parent, text=f"{slot.label} — {slot.role}",
+                                padding=6)
+            fr.pack(fill="x", padx=10, pady=3)
+            info = tk.StringVar(value="")
+            ttk.Label(fr, textvariable=info, wraplength=880,
+                      font=("TkDefaultFont", 9)).pack(anchor="w")
+            btns = ttk.Frame(fr); btns.pack(anchor="w", pady=2)
+            wid = slot.id
+            for label, cmd in [
+                ("Bind window", lambda w=wid: self._w_bind(w)),
+                ("Verify session", lambda w=wid: self._w_verify(w)),
+                ("Prepare handoff", lambda w=wid: self._w_handoff(w)),
+                ("Submitted", lambda w=wid: self._w_submitted(w)),
+                ("Done — confirm", lambda w=wid: self._w_done(w)),
+                ("Transfer report", lambda w=wid: self._w_report(w)),
+                ("Integrate", lambda w=wid: self._w_integrate(w)),
+                ("Release", lambda w=wid: self._w_release(w)),
+            ]:
+                ttk.Button(btns, text=label, command=cmd, width=14).pack(
+                    side="left", padx=2)
+            self._worker_rows[wid] = {"frame": fr, "info": info,
+                                      "label": slot.label}
+        ttk.Label(parent, text="Integration log", padding=(10, 0)).pack(anchor="w")
+        self._gate_view = scrolledtext.ScrolledText(parent, height=8,
+                                                    state="disabled")
+        self._gate_view.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+    def _w_say(self, res) -> None:
+        self.log.append("ui", res.detail)
+        if not res.ok:
+            messagebox.showinfo("Workers", res.detail)
+        self._refresh_workers()
+
+    def _w_schedule(self) -> None:
+        report = self.orch.schedule()
+        lines = [f"Verified sessions: {report['verified_sessions']}/5 "
+                 f"(concurrency limit {report['concurrency_limit']})"]
+        for tid, wid in report["assigned"]:
+            lines.append(f"  {tid} -> {wid}")
+        for b in report["blocked"]:
+            lines.append(f"  BLOCKED {b['task']}: {b['reason']}")
+        self.log.append("orchestrator", "Schedule: " + " | ".join(lines))
+        messagebox.showinfo("Schedule", "\n".join(lines))
+        self._refresh_workers()
+
+    def _w_bind(self, wid: str) -> None:
+        wins = muse_link.list_windows("")
+        if not wins:
+            messagebox.showinfo("Bind window", "No windows found. Open the Muse window first.")
+            return
+        names = "\n".join(f"{i+1}. {w.title[:80]}" for i, w in enumerate(wins[:15]))
+        choice = _ask_choice(self.root, "Select window",
+                             f"Pick the Muse window for this worker:\n\n{names}\n\nType the number:",
+                             len(wins))
+        if choice is not None:
+            self.orch.workers.bind_session(wid, wins[choice].title)
+            ok = muse_link.focus_window(wins[choice].title)
+            self.log.append("app", f"{wid} bound to '{wins[choice].title[:50]}' (focus {'ok' if ok else 'FAILED'})")
+            messagebox.showinfo("Bind window",
+                                f"Bound. Now press 'Verify session' and follow the probe step.")
+        self._refresh_workers()
+
+    def _w_verify(self, wid: str) -> None:
+        slot = self.orch.workers.get(wid)
+        if not slot or not slot.window_title:
+            messagebox.showinfo("Verify session", "Bind a window first.")
+            return
+        probe = f"Reply with exactly this line and nothing else: {slot.label} is live"
+        self._copy(probe)
+        muse_link.focus_window(slot.window_title)
+        reply = _ask_text(self.root, "Verify session",
+                          f"1. The probe prompt was copied and {slot.label}'s window focused.\n"
+                          f"2. Paste it into that Muse session and submit.\n"
+                          f"3. Paste the session's reply below:\n")
+        if reply is None:
+            return
+        ok, msg = self.orch.workers.verify_session(wid, reply)
+        self.log.append("app", f"Verify {wid}: {msg}")
+        messagebox.showinfo("Verify session", msg)
+        self._refresh_workers()
+
+    def _w_handoff(self, wid: str) -> None:
+        self._w_say(self.orch.prepare_worker_handoff(wid))
+
+    def _w_submitted(self, wid: str) -> None:
+        self._w_say(self.orch.worker_submitted(wid))
+
+    def _w_done(self, wid: str) -> None:
+        slot = self.orch.workers.get(wid)
+        if slot and not messagebox.askyesno(
+                "Confirm", f"Has {slot.label}'s session ACTUALLY finished?\n\nOnly say Yes if you can see the completed work."):
+            self.log.append("app", f"{wid}: completion not confirmed.")
+            return
+        self._w_say(self.orch.worker_done(wid))
+
+    def _w_report(self, wid: str) -> None:
+        text = _ask_text(self.root, "Transfer report",
+                         "Paste the worker's completion report below (don't retype):")
+        if text is None:
+            return
+        self._w_say(self.orch.submit_worker_report(wid, text))
+
+    def _w_integrate(self, wid: str) -> None:
+        slot = self.orch.workers.get(wid)
+        if not slot:
+            return
+        if not messagebox.askyesno("Integrate",
+                                    f"Run the integration gate for {slot.label} ({slot.task_id})?\n\n"
+                                    f"This inspects the diff, runs tests/build, and merges "
+                                    f"into the integration branch on success."):
+            return
+        self.log.append("gate", f"Gate started for {slot.task_id}…")
+        def work() -> None:
+            res = self.orch.integrate_worker(wid)
+            self.root.after(0, lambda: self._w_say(res))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _w_release(self, wid: str) -> None:
+        slot = self.orch.workers.get(wid)
+        if slot and slot.task_id:
+            # Return the task to the queue; keep ownership clean.
+            t = self.orch.queue.get(slot.task_id)
+            if t:
+                t.status = "backlog"; t.owner = ""; self.orch.queue.save()
+            self.orch.ownership.release_task(slot.task_id)
+        self.orch.workers.release(wid, "released by user")
+        self.log.append("app", f"{wid} released.")
+        self._refresh_workers()
+
+    def _w_safe_shutdown(self) -> None:
+        self.orch.safe_shutdown()
+        messagebox.showinfo("Safe shutdown",
+                            "All worker state, queues, and ownership saved.\n"
+                            "Worker branches are preserved. You can close the app.")
+
+    def _refresh_workers(self) -> None:
+        if not hasattr(self, "_worker_rows"):
+            return
+        dash = self.orch.dashboard()
+        self._sess_lbl.config(
+            text=f"Verified sessions: {dash['verified_sessions']}/5   "
+                 f"Concurrency limit: {dash['concurrency_limit']}")
+        for row in dash["workers"]:
+            wid = row["id"]
+            if wid not in self._worker_rows:
+                continue
+            idle = row["idle_for_s"]
+            idle_s = "never" if idle < 0 else f"{int(idle)}s ago"
+            waiting = "  *** WAITING FOR YOU ***" if row["waiting_for_user"] else ""
+            files = ", ".join(row["files"][:4]) + ("…" if len(row["files"]) > 4 else "")
+            self._worker_rows[wid]["info"].set(
+                f"[{row['connection']}] state={row['state']}  task={row['task'] or '—'}  "
+                f"branch={row['branch'] or '—'}{waiting}\n"
+                f"files: {files or '—'}   last test: {row['last_test'] or '—'}   "
+                f"errors={row['errors']} retries={row['retries']}   last activity: {idle_s}"
+                + (f"   note: {row['note']}" if row["note"] else ""))
+            # Keep the frame title in sync with label/role edits.
+            slot = self.orch.workers.get(wid)
+            if slot:
+                self._worker_rows[wid]["frame"].config(
+                    text=f"{slot.label} — {slot.role}")
+        if hasattr(self, "_gate_view") and self._gate_view.winfo_exists():
+            self._gate_view.config(state="normal")
+            self._gate_view.delete("1.0", "end")
+            for rec in self.log.tail(30):
+                if rec["kind"] in ("gate", "orchestrator"):
+                    self._gate_view.insert("end", f"{rec['kind']}: {rec['message']}\n")
+            self._gate_view.config(state="disabled")
+            self._gate_view.see("end")
 
     # -- dashboard actions -------------------------------------------------------
     def _say(self, res: StepResult) -> None:
@@ -400,6 +603,7 @@ class BridgeApp:
     def _tick(self) -> None:
         try:
             self._refresh()
+            self._refresh_workers()
         finally:
             if self.root.winfo_exists():
                 self.root.after(2000, self._tick)
@@ -465,6 +669,29 @@ def _popup(root: tk.Tk, title: str, text: str) -> None:
     st.pack(fill="both", expand=True, padx=8, pady=8)
     st.insert("1.0", text)
     st.config(state="disabled")
+
+
+def _ask_text(root: tk.Tk, title: str, prompt: str) -> str | None:
+    """Multi-line paste dialog. Returns text or None if cancelled."""
+    result: dict[str, str | None] = {"v": None}
+    win = tk.Toplevel(root)
+    win.title(title)
+    win.geometry("600x400")
+    ttk.Label(win, text=prompt, wraplength=560, padding=10).pack(anchor="w")
+    st = scrolledtext.ScrolledText(win, height=10)
+    st.pack(fill="both", expand=True, padx=10)
+    def ok() -> None:
+        result["v"] = st.get("1.0", "end")
+        win.destroy()
+    def cancel() -> None:
+        win.destroy()
+    row = ttk.Frame(win); row.pack(pady=8)
+    ttk.Button(row, text="Save", command=ok).pack(side="left", padx=6)
+    ttk.Button(row, text="Cancel", command=cancel).pack(side="left")
+    win.transient(root)
+    win.grab_set()
+    root.wait_window(win)
+    return result["v"]
 
 
 def _ask_choice(root: tk.Tk, title: str, prompt: str, n: int) -> int | None:

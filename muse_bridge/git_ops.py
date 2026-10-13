@@ -36,6 +36,11 @@ def _run(repo: Path, *args: str, timeout: int = 120) -> CmdResult:
         return CmdResult(False, "", "git command timed out", 124)
 
 
+def run_git(repo: Path, *args: str, timeout: int = 120) -> CmdResult:
+    """Public wrapper for running git in a repo/worktree."""
+    return _run(repo, *args, timeout=timeout)
+
+
 def is_git_repo(path: str | Path) -> bool:
     p = Path(path)
     r = _run(p, "rev-parse", "--is-inside-work-tree")
