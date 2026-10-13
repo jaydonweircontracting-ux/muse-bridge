@@ -18,7 +18,10 @@ python -m pip install --upgrade pip
 python -m pip install pyinstaller pywinauto
 
 echo Building MuseBridge.exe ...
-python -m PyInstaller --noconfirm --onefile --windowed ^
+echo Cleaning stale build output...
+if exist build rmdir /s /q build
+if exist dist rmdir /s /q dist
+python -m PyInstaller --noconfirm --clean --onefile --windowed ^
   --name MuseBridge ^
   main.py
 
