@@ -93,6 +93,18 @@ class TestGuiRunControl(unittest.TestCase):
         self.assertIn("IDLE", self.app._run_status.cget("text"))
         self.assertIn("START", self.app._run_btn.cget("text"))
 
+    def test_dashboard_writes_recovery_file(self) -> None:
+        import json
+        from muse_bridge.recovery import recovery_path
+        from muse_bridge.store import data_dir
+        # data_dir() resolves from the fake HOME set in setUp.
+        path = recovery_path(data_dir())
+        self.assertTrue(path.exists(), f"missing: {path}")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(data["version"], 1)
+        self.assertIn("workers", data)
+        self.assertIn("how_to_reconnect", data)
+
     def test_start_refuses_without_verified_workers(self) -> None:
         self.app._run_btn.invoke()
         self.root.update()

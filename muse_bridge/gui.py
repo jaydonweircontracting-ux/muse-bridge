@@ -199,6 +199,15 @@ class BridgeApp:
     def show_dashboard(self) -> None:
         self._clear()
         self._build_run_bar(self.root)
+        # Recovery: refresh the lightweight reconnect file and re-find
+        # worker windows by title (non-intrusive, never steals focus).
+        try:
+            from .recovery import reconnect, write_recovery
+            write_recovery(self.orch)
+            for line in reconnect(self.orch):
+                self.log.append("recovery", line)
+        except Exception as exc:
+            self.log.append("recovery", f"Recovery check failed: {exc}")
         nb = ttk.Notebook(self.root)
         nb.pack(fill="both", expand=True)
         hf = ttk.Frame(nb)
@@ -345,6 +354,11 @@ class BridgeApp:
     def _on_close(self) -> None:
         try:
             self.hotkeys.stop()
+        except Exception:
+            pass
+        try:
+            from .recovery import write_recovery
+            write_recovery(self.orch)
         except Exception:
             pass
         try:
