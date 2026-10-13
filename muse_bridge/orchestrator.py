@@ -222,6 +222,47 @@ class Orchestrator:
                         f"{result.steps[-1][:200] if result.steps else 'see log'}. "
                         f"Worker branch {slot.branch} preserved.")
 
+    # -- review packets (Phase D) --------------------------------------------------
+    def prepare_review_packet(self, worker_id: str) -> tuple[bool, str]:
+        """Assemble an evidence review packet for ChatGPT. Copies to clipboard."""
+        from .github import GitHubConnection
+        from .review_packet import build_review_packet
+        slot = self.workers.get(worker_id)
+        if not slot or not slot.task_id:
+            return False, "Worker has no task."
+        task = self.queue.get(slot.task_id)
+        repo = self.repo()
+        if not task or repo is None:
+            return False, "Task or repo unavailable."
+        conn = GitHubConnection(repo)
+        diff = conn.compare_branch(slot.branch or task.branch or "HEAD")
+        changed = diff["files"] or list(task.expected_files)
+        packet = build_review_packet(
+            task, slot.label, slot.branch or task.branch,
+            changed, diff["stat"], diff["patch"],
+            task.verification,
+            limitations=(task.evidence.get("muse_report", "")[:500]
+                         if isinstance(task.evidence, dict) else ""))
+        if self.copy_text:
+            self.copy_text(packet)
+        self.log.append("orchestrator",
+                        f"Review packet prepared for {task.id} "
+                        f"({len(changed)} files).")
+        return True, packet
+
+    def attach_chatgpt_review(self, task_id: str, text: str) -> tuple[bool, str]:
+        """Attach a transferred ChatGPT review to a task. Advisory only."""
+        if not text.strip():
+            return False, "Empty review — nothing saved."
+        task = self.queue.get(task_id)
+        if not task:
+            return False, "Unknown task."
+        task.evidence["chatgpt_review"] = text[:4000]
+        self.queue.save()
+        self.log.append("orchestrator",
+                        f"ChatGPT review attached to {task_id}.")
+        return True, f"Review attached to {task_id} (advisory; tests rule)."
+
     # -- dashboard ---------------------------------------------------------------
     def dashboard(self) -> dict:
         dash = {

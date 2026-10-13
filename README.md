@@ -75,14 +75,33 @@ muse_bridge/
   muse_link.py           Window listing + focus (pywinauto); no scraping, no guessing
   chatgpt.py             Manual-relay coordination (no API in this edition)
   git_ops.py             Safe git reads, diff scan, local test/build runner
-  gui.py                 Tkinter wizard + control panel (Handoffs + Workers + Accounts tabs)
+  gui.py                 Tkinter wizard + control panel (Handoffs + Workers + Accounts + GitHub tabs)
 tests/test_core.py       19 unit tests
 tests/test_orchestration.py  14 orchestration tests
 tests/test_accounts.py   11 account-manager tests
+tests/test_github.py     11 GitHub + review-packet tests
 scripts/acceptance_walkthrough.py      25-check handoff cycle (25/25 pass)
 scripts/acceptance_orchestration.py    19-check multi-worker cycle (19/19 pass)
 build_windows.bat        The single packaging step (run on Windows)
 ```
+
+## GitHub integration (GitHub tab, read-only by default)
+
+- **Connection:** local git always works for reads; authenticated access via
+  the official GitHub CLI (`gh auth login` once — the bridge never touches
+  your token). Status, user, and repo visibility shown honestly.
+- **Panel:** repository, branch, HEAD, latest commit, 20-commit history,
+  branch list (worker branches flagged), one-click branch compare
+  (worker branch vs integration/main) with diff stats.
+- **Review packets:** per completed worker task — description, worker/branch,
+  files, diff, tests, typecheck, build, limitations, recommended action.
+  One click copies it for ChatGPT; the returned review attaches to the task
+  as advisory (automated tests remain authoritative).
+- **ChatGPT prompts** now include live repository context (branch, HEAD,
+  recent commits, worker branches, uncommitted changes) read at prompt time.
+- ChatGPT's own GitHub connector is separate and gives this app nothing;
+  the bridge's integration is its own, and clipboard handoff remains the
+  no-API path — only tested automation is ever claimed.
 
 ## Multi-account access (Accounts tab)
 
@@ -144,17 +163,12 @@ Up to five Muse workers collaborate on the **same** Adventure Game V2 repo:
 
 ## Verification status
 
-- 44/44 unit tests pass (handoff engine + orchestration engine + accounts).
-- 25/25 handoff acceptance checks pass: full plan→dev→verify→review→
-  checkpoint cycle plus close/reopen recovery, against a fixture repo.
-- 19/19 orchestration acceptance checks pass: two concurrent tasks in
-  separate worktrees, conflict blocking, evidence-based integration,
-  failed-test merge block with worker branch preserved, restart recovery,
-  honest 2/5 concurrency reporting.
-- Account manager: all logic tested (binding rules, isolation, no-secret
-  storage). The real Facebook→Meta→Muse login flow is NOT testable from
-  this Linux environment — it is verified on your PC via the Accounts tab.
+- 55/55 unit tests pass (handoff + orchestration + accounts + GitHub).
+- 25/25 handoff acceptance checks pass; 19/19 orchestration checks pass.
+- GitHub panel: all logic tested against fixture repos (identity, history,
+  file reads, branch compare, packet assembly, review attachment).
+  `gh` auth detection tested with mocks; real `gh auth login` must happen
+  on your PC.
 - The Windows EXE itself is **not yet built** — this environment is Linux and
   PyInstaller only builds for its host OS. Run `build_windows.bat` on a
-  Windows PC for the one remaining packaging step, then use the wizard's
-  Test buttons to verify window targeting on your machine.
+  Windows PC for the one remaining packaging step.

@@ -193,12 +193,15 @@ class BridgeApp:
         hf = ttk.Frame(nb)
         wf = ttk.Frame(nb)
         af = ttk.Frame(nb)
+        ghf = ttk.Frame(nb)
         nb.add(hf, text="Handoffs")
         nb.add(wf, text="Workers (1–5)")
         nb.add(af, text="Accounts")
+        nb.add(ghf, text="GitHub")
         self._build_handoff_tab(hf)
         self._build_workers_tab(wf)
         self._build_accounts_tab(af)
+        self._build_github_tab(ghf)
         # Restart recovery: tell the user what was happening.
         st = self.coord.tracker.state
         if st not in (HandoffState.READY, HandoffState.STOPPED):
@@ -258,8 +261,11 @@ class BridgeApp:
         tr.pack(fill="x", padx=10, pady=4)
         self._transfer = scrolledtext.ScrolledText(tr, height=4)
         self._transfer.pack(fill="x", pady=2)
-        ttk.Button(tr, text="SAVE TRANSFERRED RESPONSE",
-                   command=self._save_transfer).pack(anchor="e")
+        trow = ttk.Frame(tr); trow.pack(anchor="e")
+        ttk.Button(trow, text="SAVE TRANSFERRED RESPONSE",
+                   command=self._save_transfer).pack(side="left", padx=4)
+        ttk.Button(trow, text="ATTACH AS CHATGPT REVIEW",
+                   command=self._attach_review).pack(side="left")
 
         info = ttk.Frame(parent, padding=(10, 4)); info.pack(fill="x")
         self._info_vars: dict[str, tk.StringVar] = {}
@@ -312,6 +318,7 @@ class BridgeApp:
                 ("Done — confirm", lambda w=wid: self._w_done(w)),
                 ("Transfer report", lambda w=wid: self._w_report(w)),
                 ("Integrate", lambda w=wid: self._w_integrate(w)),
+                ("Review packet", lambda w=wid: self._w_packet(w)),
                 ("Release", lambda w=wid: self._w_release(w)),
             ]:
                 ttk.Button(btns, text=label, command=cmd, width=14).pack(
@@ -412,6 +419,17 @@ class BridgeApp:
             res = self.orch.integrate_worker(wid)
             self.root.after(0, lambda: self._w_say(res))
         threading.Thread(target=work, daemon=True).start()
+
+    def _w_packet(self, wid: str) -> None:
+        ok, packet = self.orch.prepare_review_packet(wid)
+        if ok:
+            slot = self.orch.workers.get(wid)
+            _popup(self.root, f"Review packet — {slot.task_id}", packet)
+            messagebox.showinfo("Review packet",
+                                "Packet copied to clipboard. Paste it into ChatGPT, then use "
+                                "'Attach ChatGPT review' on the Handoffs tab.")
+        else:
+            messagebox.showinfo("Review packet", packet)
 
     def _w_release(self, wid: str) -> None:
         slot = self.orch.workers.get(wid)
@@ -627,6 +645,120 @@ class BridgeApp:
                 ttk.Button(btns, text=label, command=cmd, width=14).pack(
                     side="left", padx=2)
 
+    # -- github tab ----------------------------------------------------------------
+    def _build_github_tab(self, parent) -> None:
+        top = ttk.Frame(parent, padding=10); top.pack(fill="x")
+        ttk.Label(top, text="GitHub — read-only",
+                  font=("TkDefaultFont", 12, "bold")).pack(side="left")
+        self._gh_status_lbl = ttk.Label(top, text="", wraplength=600)
+        self._gh_status_lbl.pack(side="left", padx=16)
+        ttk.Button(top, text="REFRESH",
+                   command=self._gh_refresh).pack(side="left", padx=4)
+        ttk.Label(parent, wraplength=920, padding=(10, 2), foreground="gray",
+                  text="Read-only by default. Authenticated access uses the official "
+                       "GitHub CLI (gh) — run `gh auth login` once; the bridge never "
+                       "handles your token. ChatGPT's own GitHub connector is separate "
+                       "and does not give this app any access.").pack(fill="x")
+
+        self._gh_info = tk.StringVar(value="")
+        ttk.Label(parent, textvariable=self._gh_info, wraplength=920,
+                  padding=(10, 2), font=("TkDefaultFont", 9)).pack(fill="x")
+
+        mid = ttk.Frame(parent, padding=(10, 0)); mid.pack(fill="both", expand=True)
+        left = ttk.LabelFrame(mid, text="Commit history", padding=6)
+        left.pack(side="left", fill="both", expand=True, padx=(0, 4))
+        self._gh_history = tk.Listbox(left, height=12)
+        self._gh_history.pack(fill="both", expand=True)
+        right = ttk.LabelFrame(mid, text="Branches", padding=6)
+        right.pack(side="left", fill="both", expand=True, padx=(4, 0))
+        self._gh_branches = tk.Listbox(right, height=12)
+        self._gh_branches.pack(fill="both", expand=True)
+
+        bot = ttk.Frame(parent, padding=10); bot.pack(fill="x")
+        ttk.Button(bot, text="COMPARE SELECTED BRANCH",
+                   command=self._gh_compare).pack(side="left", padx=4)
+        ttk.Button(bot, text="REVIEW PACKET FOR SELECTED",
+                   command=self._gh_packet).pack(side="left", padx=4)
+        self._gh_diff = scrolledtext.ScrolledText(parent, height=10,
+                                                  state="disabled")
+        self._gh_diff.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+    def _gh_conn(self):
+        from .github import GitHubConnection
+        repo = self.orch.repo()
+        return GitHubConnection(repo) if repo else None
+
+    def _gh_refresh(self) -> None:
+        from .github import gh_auth_status
+        conn = self._gh_conn()
+        auth = gh_auth_status()
+        if conn is None:
+            self._gh_status_lbl.config(text="No game repo configured.")
+            return
+        ident = conn.identity()
+        latest = conn.latest_commit()
+        remote = conn.remote_info()
+        status_txt = (f"{'✓ ' if auth.connected else '○ '}{auth.detail}")
+        self._gh_status_lbl.config(text=status_txt)
+        info = (f"{ident['owner']}/{ident['repo'] or '(local only)'}   "
+                f"branch={ident['branch']}   HEAD={ident['head']}")
+        if remote.get("visibility"):
+            info += f"   visibility={remote['visibility']}"
+        self._gh_info.set(info)
+        self._gh_history.delete(0, "end")
+        for c in conn.commit_history(20):
+            self._gh_history.insert("end",
+                                    f"{c['short']} {c['date']} {c['subject'][:70]}")
+        self._gh_branches.delete(0, "end")
+        br = conn.branches()
+        self._bridge_branches = br["local"]
+        for b in br["local"]:
+            mark = "  [worker]" if b.startswith("bridge/") else ""
+            self._gh_branches.insert("end", b + mark)
+        self.log.append("github", f"Refreshed: {ident['branch']}@{ident['head']}")
+
+    def _gh_compare(self) -> None:
+        conn = self._gh_conn()
+        if conn is None or not hasattr(self, "_bridge_branches"):
+            return
+        sel = self._gh_branches.curselection()
+        if not sel:
+            messagebox.showinfo("Compare", "Select a branch first.")
+            return
+        branch = self._bridge_branches[sel[0]]
+        base = "bridge/integration" if branch.startswith("bridge/") else "main"
+        # If the integration branch doesn't exist yet, compare against main.
+        diff = conn.compare_branch(branch, base)
+        if not diff["files"] and base != "main":
+            diff = conn.compare_branch(branch, "main")
+            base = "main"
+        self._gh_diff.config(state="normal")
+        self._gh_diff.delete("1.0", "end")
+        self._gh_diff.insert("end", f"{branch} vs {base}\n\n{diff['stat']}\n")
+        self._gh_diff.config(state="disabled")
+        self.log.append("github", f"Compared {branch} vs {base}: {len(diff['files'])} files")
+
+    def _gh_packet(self) -> None:
+        if not hasattr(self, "_bridge_branches"):
+            return
+        sel = self._gh_branches.curselection()
+        if not sel:
+            messagebox.showinfo("Review packet", "Select a worker branch first.")
+            return
+        branch = self._bridge_branches[sel[0]]
+        # Find the task that owns this branch.
+        task = next((t for t in self.orch.queue.tasks if t.branch == branch), None)
+        slot = next((s for s in self.orch.workers.slots if s.branch == branch), None)
+        if not task:
+            messagebox.showinfo("Review packet", "No task found for that branch.")
+            return
+        ok, packet = self.orch.prepare_review_packet(slot.id if slot else "w1")
+        if ok:
+            _popup(self.root, f"Review packet — {task.id}", packet)
+            self.log.append("github", f"Review packet prepared for {task.id} (copied).")
+        else:
+            messagebox.showinfo("Review packet", packet)
+
     # -- dashboard actions -------------------------------------------------------
     def _say(self, res: StepResult) -> None:
         self.log.append("ui", res.detail)
@@ -725,6 +857,35 @@ class BridgeApp:
             res = StepResult(False, "Unknown handoff stage.")
         self._transfer.delete("1.0", "end")
         self._say(res)
+
+    def _attach_review(self) -> None:
+        text = self._transfer.get("1.0", "end")
+        if not text.strip():
+            messagebox.showinfo("Attach review", "Paste the ChatGPT review first.")
+            return
+        # Attach to the current handoff's task, else ask which task.
+        task_id = self.coord.current.task_id if self.coord.current else ""
+        if not task_id:
+            cands = [t for t in self.orch.queue.tasks
+                     if t.status in ("active", "completed")]
+            if not cands:
+                messagebox.showinfo("Attach review", "No active/completed tasks.")
+                return
+            names = "\n".join(f"{i+1}. {t.id} — {t.title[:60]}"
+                              for i, t in enumerate(cands))
+            choice = _ask_choice(self.root, "Attach review",
+                                 f"Attach to which task?\n\n{names}\n\nType the number:",
+                                 len(cands))
+            if choice is None:
+                return
+            task_id = cands[choice].id
+        ok, msg = self.orch.attach_chatgpt_review(task_id, text)
+        self.log.append("ui", msg)
+        if ok:
+            self._transfer.delete("1.0", "end")
+            messagebox.showinfo("Attach review", msg)
+        else:
+            messagebox.showinfo("Attach review", msg)
 
     def _view_queue(self) -> None:
         lines = ["TASK QUEUE", ""]

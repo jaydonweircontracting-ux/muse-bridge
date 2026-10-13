@@ -32,13 +32,16 @@ def new_id() -> str:
 
 
 def build_planning_prompt(master_prompt: str, project_summary: str,
-                          repo_facts: str) -> str:
+                          repo_facts: str, repo_context: str = "") -> str:
+    context_block = (f"---\nLIVE REPOSITORY CONTEXT (read just now, do not invent):\n"
+                     f"{repo_context.strip()}\n\n" if repo_context.strip() else "")
     return (
         f"{master_prompt.strip()}\n\n"
         f"---\nCURRENT PROJECT SUMMARY (maintained by you across sessions):\n"
         f"{project_summary.strip() or '(none yet — first planning cycle)'}\n\n"
         f"---\nREPOSITORY FACTS (read from the actual project, do not invent):\n"
         f"{repo_facts.strip() or '(not scanned yet)'}\n\n"
+        f"{context_block}"
         f"---\nYOUR JOB NOW: propose the next development task(s).\n"
         f"Reply with each task on its own line in EXACTLY this format:\n"
         f"TASK: <short title> | <one-line brief>\n"

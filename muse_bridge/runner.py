@@ -74,6 +74,17 @@ class Coordinator:
         except Exception:
             pass
 
+    def live_repo_context(self) -> str:
+        """Live repository context for prompts. Empty string if unavailable."""
+        try:
+            from .github import GitHubConnection, repo_context_block
+            repo = self._repo()
+            if repo is None:
+                return ""
+            return repo_context_block(GitHubConnection(repo))
+        except Exception:
+            return ""
+
     def describe_status(self) -> str:
         """Plain-language 'what was happening' for restart recovery."""
         s = self.tracker.state
@@ -105,7 +116,8 @@ class Coordinator:
         prompt = build_planning_prompt(
             self.brief.load().get("text", ""),
             prof.get("project_summary", ""),
-            self.profile.repo_facts_text())
+            self.profile.repo_facts_text(),
+            self.live_repo_context())
         h = Handoff(new_id(), "plan", "", "Planning: next task",
                     prompt, "chatgpt",
                     "Copy this prompt, paste it into ChatGPT, submit, then "
@@ -293,6 +305,11 @@ class Coordinator:
         self.current.response = text
         self.current.done = True
         task_id, title = self.current.task_id, self.current.title
+        # Attach ChatGPT's review to the task itself (advisory; tests rule).
+        if task:
+            task.evidence["chatgpt_review"] = text[:4000]
+            task.evidence["chatgpt_verdict"] = "APPROVE" if approved else "REJECT"
+            self.queue.save()
         self.current = None
         if approved and task and "FAILED" not in self.last_test_output:
             cp = {"commit": git_ops.head_commit(self._repo()) if self._repo() else "",
