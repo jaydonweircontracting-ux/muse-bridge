@@ -15,11 +15,14 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 from pathlib import Path
 
 from . import git_ops, muse_link
+from .hotkeys import DEFAULT_HOTKEYS, HotkeyManager
 from .orchestrator import Orchestrator
 from .profile import ProjectProfile
+from .run_control import RunController, RunState
 from .runner import Coordinator, StepResult
 from .state import HandoffState
 from .store import Brief, Checkpoints, EventLog, Settings, TaskQueue
+from .window_layout import tile_windows
 from .workers import WorkerState
 
 
@@ -52,6 +55,13 @@ class BridgeApp:
         self.orch = Orchestrator()
         self.orch.focus_window = muse_link.focus_window
         self.orch.copy_text = self._copy
+        # Bot-client run control: START/STOP + global hotkeys.
+        self.run_ctl = RunController(orch=self.orch)
+        self.run_ctl.on_event = lambda msg: self.log.append("run", msg)
+        self.hotkeys = HotkeyManager(dispatch=lambda cb: self.root.after(0, cb))
+        self._run_bar_widgets: dict = {}
+        self._setup_hotkeys()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         if not self.settings.get("first_run_complete"):
             self.show_wizard()
         else:
@@ -188,6 +198,7 @@ class BridgeApp:
     # -- dashboard ---------------------------------------------------------------
     def show_dashboard(self) -> None:
         self._clear()
+        self._build_run_bar(self.root)
         nb = ttk.Notebook(self.root)
         nb.pack(fill="both", expand=True)
         hf = ttk.Frame(nb)
@@ -212,6 +223,131 @@ class BridgeApp:
                 + self.coord.describe_status()
                 + "\n\nNothing was lost. Press NEXT HANDOFF to continue, "
                   "or STOP to stand down.")
+
+    # -- run control bar (bot-client style START/STOP + hotkeys) ------------------
+
+    def _build_run_bar(self, parent) -> None:
+        bar = ttk.Frame(parent, padding=(8, 6))
+        bar.pack(fill="x")
+        self._run_dot = tk.Canvas(bar, width=14, height=14,
+                                  highlightthickness=0)
+        self._run_dot.pack(side="left", padx=(0, 6))
+        self._run_status = ttk.Label(bar, text="IDLE", width=34)
+        self._run_status.pack(side="left")
+        self._run_btn = ttk.Button(bar, text="▶  START  (Ctrl+Shift+S)",
+                                   command=self._run_toggle, width=24)
+        self._run_btn.pack(side="left", padx=8)
+        ttk.Button(bar, text="Tile windows",
+                   command=self._tile_worker_windows).pack(side="left")
+        ttk.Label(bar,
+                  text="Hotkeys: Ctrl+Shift+S start/stop · "
+                       "Ctrl+Shift+X stop now · Ctrl+Shift+1-5 focus worker",
+                  foreground="gray").pack(side="right", padx=8)
+        self._refresh_run_bar()
+        # Drive the run loop on the UI thread (schedule once).
+        if not getattr(self, "_run_tick_scheduled", False):
+            self._run_tick_scheduled = True
+            self.root.after(int(self.run_ctl.tick_interval_s * 1000),
+                            self._run_tick)
+
+    def _refresh_run_bar(self) -> None:
+        st = self.run_ctl.state
+        colors = {RunState.IDLE: "gray", RunState.RUNNING: "green",
+                  RunState.STOPPING: "orange"}
+        self._run_dot.delete("all")
+        self._run_dot.create_oval(2, 2, 12, 12, fill=colors[st], outline="")
+        self._run_status.config(text=self.run_ctl.describe().upper())
+        self._run_btn.config(
+            text=("⏹  STOP  (Ctrl+Shift+S)" if st == RunState.RUNNING
+                  else "▶  START  (Ctrl+Shift+S)"))
+
+    def _run_toggle(self) -> None:
+        ok, msg = self.run_ctl.toggle()
+        self.log.append("run", msg)
+        if not ok:
+            messagebox.showwarning("Run control", msg)
+        self._refresh_run_bar()
+
+    def _run_tick(self) -> None:
+        try:
+            events = self.run_ctl.tick()
+            if events:
+                self._refresh_workers_tab_if_visible()
+        except Exception as exc:
+            self.log.append("run", f"Tick error: {exc}")
+        self._refresh_run_bar()
+        self.root.after(int(self.run_ctl.tick_interval_s * 1000),
+                        self._run_tick)
+
+    def _refresh_workers_tab_if_visible(self) -> None:
+        try:
+            self._refresh_workers()
+        except Exception:
+            pass
+
+    # -- global hotkeys --------------------------------------------------------
+
+    def _setup_hotkeys(self) -> None:
+        bound = 0
+        for spec in DEFAULT_HOTKEYS:
+            if spec.name == "toggle_run":
+                ok = self.hotkeys.register(spec, self._run_toggle)
+            elif spec.name == "stop_now":
+                ok = self.hotkeys.register(
+                    spec, lambda: self._hk_stop_now())
+            elif spec.name.startswith("focus_w"):
+                wid = "w" + spec.name[-1]
+                ok = self.hotkeys.register(
+                    spec, lambda w=wid: self._focus_worker(w))
+            else:
+                ok = False
+            bound += 1 if ok else 0
+        if self.hotkeys.start():
+            self.log.append("app",
+                            f"Global hotkeys active ({bound} bound).")
+        else:
+            self.log.append("app",
+                            "Global hotkeys unavailable on this platform.")
+
+    def _hk_stop_now(self) -> None:
+        ok, msg = self.run_ctl.force_stop()
+        self.log.append("run", "Hotkey: " + msg)
+        self._refresh_run_bar()
+        if not ok:
+            messagebox.showinfo("Run control", msg)
+
+    def _focus_worker(self, worker_id: str) -> None:
+        try:
+            slot = self.orch.workers.get(worker_id)
+            title = getattr(slot, "window_title", "") if slot else ""
+        except Exception:
+            title = ""
+        if title and muse_link.focus_window(title):
+            self.log.append("run", f"Hotkey: focused worker {worker_id}.")
+        else:
+            self.log.append(
+                "run", f"Hotkey: no bound window for worker {worker_id}.")
+
+    def _tile_worker_windows(self) -> None:
+        try:
+            titles = [s.window_title for s in self.orch.workers.slots
+                      if getattr(s, "window_title", "")]
+        except Exception:
+            titles = []
+        placed, msg = tile_windows(titles)
+        self.log.append("run", "Tile windows: " + msg)
+        messagebox.showinfo("Tile windows", msg)
+
+    def _on_close(self) -> None:
+        try:
+            self.hotkeys.stop()
+        except Exception:
+            pass
+        try:
+            self.orch.safe_shutdown()
+        except Exception:
+            pass
+        self.root.destroy()
 
     def _build_handoff_tab(self, parent) -> None:
         top = ttk.Frame(parent, padding=10); top.pack(fill="x")
