@@ -23,6 +23,14 @@ class RunState(str, Enum):
     STOPPING = "stopping"
 
 
+# Worker states that mean "something is still in flight" — the run loop
+# must keep waiting while any worker is in one of these.
+_ACTIVE_STATES = frozenset({
+    "ASSIGNED", "WORKING", "WAITING_FOR_RESPONSE",
+    "WAITING_FOR_USER", "REVIEW", "INTEGRATING",
+})
+
+
 @dataclass
 class RunController:
     """Wraps an Orchestrator with start/stop semantics. No threads here —
@@ -102,15 +110,63 @@ class RunController:
         self._last_report = report or {}
         assigned = (report or {}).get("assigned", [])
         for task_id, worker_id in assigned:
-            msg = f"Assigned {task_id} -> worker {worker_id} — handoff ready."
+            msg = f"Assigned {task_id} -> worker {worker_id}."
             events.append(msg)
             self._emit(msg)
+            # Raise the handoff: copy the prompt, focus the worker's window,
+            # move the worker to WORKING. The user still pastes the prompt
+            # into the Muse window and confirms each step — the loop just
+            # never leaves a newly-assigned worker waiting on a button click.
+            try:
+                res = self.orch.prepare_worker_handoff(worker_id)  # type: ignore[union-attr]
+                hmsg = (f"Handoff ready for worker {worker_id}: {res.detail}"
+                        if getattr(res, "ok", False)
+                        else f"Handoff FAILED for worker {worker_id}: "
+                             f"{getattr(res, 'detail', res)}")
+            except Exception as exc:
+                hmsg = f"Handoff error for worker {worker_id}: {exc}"
+            events.append(hmsg)
+            self._emit(hmsg)
         blocked = (report or {}).get("blocked", [])
         for item in blocked:
             msg = f"Blocked: {item}"
             events.append(msg)
             self._emit(msg)
+        # Run to completion: nothing assignable and nobody in flight means
+        # the queue is drained (or deadlocked on dependencies) — stop.
+        drained, dmsg = self._drained()
+        if drained:
+            self.state = RunState.IDLE
+            self._persist()
+            events.append(dmsg)
+            self._emit(dmsg)
         return events
+
+    def _drained(self) -> tuple[bool, str]:
+        """True when the loop has nothing left it can ever do."""
+        try:
+            slots = self.orch.workers.slots  # type: ignore[union-attr]
+        except Exception:
+            return False, ""
+        if any(getattr(s, "state", "") in _ACTIVE_STATES for s in slots):
+            return False, ""
+        try:
+            eligible = self.orch.scheduler.eligible_tasks()  # type: ignore[union-attr]
+        except Exception:
+            eligible = []
+        if eligible:
+            return False, ""
+        try:
+            remaining = [t for t in self.orch.queue.tasks  # type: ignore[union-attr]
+                         if getattr(t, "status", "") in ("backlog", "active")]
+        except Exception:
+            remaining = []
+        if remaining:
+            return True, (
+                f"Run stopped: {len(remaining)} task(s) remain but none are "
+                f"assignable and no workers are active "
+                f"(blocked on dependencies or conflicts — needs your call).")
+        return True, "Run complete: queue drained, all workers idle."
 
     # -- helpers ---------------------------------------------------------------
 

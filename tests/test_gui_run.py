@@ -41,8 +41,10 @@ class TestGuiRunControl(unittest.TestCase):
         self.infos: list[str] = []
         self._orig_warn = messagebox.showwarning
         self._orig_info = messagebox.showinfo
+        self._orig_ask = messagebox.askyesno
         messagebox.showwarning = lambda t, m: self.warnings.append(str(m))  # type: ignore
         messagebox.showinfo = lambda t, m: self.infos.append(str(m))  # type: ignore
+        messagebox.askyesno = lambda t, m: True  # type: ignore[assignment]
 
         from muse_bridge.gui import BridgeApp
         self.root = tk.Tk()
@@ -55,12 +57,14 @@ class TestGuiRunControl(unittest.TestCase):
     def tearDown(self) -> None:
         messagebox.showwarning = self._orig_warn  # type: ignore
         messagebox.showinfo = self._orig_info  # type: ignore
+        messagebox.askyesno = self._orig_ask  # type: ignore
         try:
             self.app.hotkeys.stop()
         except Exception:
             pass
         try:
-            self.root.destroy()
+            if self.root is not None:
+                self.root.destroy()
         except Exception:
             pass
         if self._old_home is None:
@@ -155,6 +159,131 @@ class TestGuiRunControl(unittest.TestCase):
         self.app._tile_worker_windows()
         self.root.update()
         self.assertTrue(self.infos, "expected an info dialog")
+
+    def test_hotkey_during_wizard_does_not_crash(self) -> None:
+        """Ctrl+Shift+S before the dashboard exists: no run bar yet, but the
+        hotkey must not crash — start just reports no verified workers."""
+        import tkinter as tk
+        from muse_bridge.gui import BridgeApp
+        # Fresh HOME so this app really is on its first run (wizard showing).
+        wiz_home = tempfile.mkdtemp()
+        old_home = os.environ.get("HOME")
+        os.environ["HOME"] = wiz_home
+        root = tk.Tk()
+        try:
+            app = BridgeApp(root)  # wizard showing, no dashboard/run bar
+            root.update()
+            self.assertFalse(hasattr(app, "_run_dot"))
+            handler = app.hotkeys._handlers.get("toggle_run")
+            assert handler is not None
+            handler()  # must not raise
+            root.update()
+            self.assertTrue(any("verified" in w.lower() for w in self.warnings))
+        finally:
+            try:
+                app.hotkeys.stop()
+            except Exception:
+                pass
+            root.destroy()
+            if old_home is None:
+                del os.environ["HOME"]
+            else:
+                os.environ["HOME"] = old_home
+
+    def test_on_close_persists_cleanly(self) -> None:
+        self._verify_worker("w1")
+        self.app._on_close()
+        # State file written; no exception. (Root is destroyed; mark it so
+        # tearDown doesn't double-destroy.)
+        self.root = None  # type: ignore
+
+    def _make_git_repo(self) -> str:
+        import subprocess
+        d = tempfile.mkdtemp()
+        def git(*args: str) -> None:
+            subprocess.run(["git", "-C", d, *args], check=True,
+                           capture_output=True, timeout=60)
+        git("init", "-b", "main")
+        git("config", "user.email", "sim@test.local")
+        git("config", "user.name", "Sim")
+        with open(os.path.join(d, "README.md"), "w") as f:
+            f.write("# sim repo\n")
+        git("add", "-A")
+        git("commit", "-m", "init")
+        return d
+
+    def test_full_worker_lifecycle(self) -> None:
+        """End-to-end through a real temp git repo: verify -> run -> handoff
+        -> submitted -> done -> report -> review packet -> integrate gate ->
+        auto-stop on drain."""
+        from muse_bridge.workers import WorkerState
+        orch = self.app.orch
+        repo = self._make_git_repo()
+        orch.settings.set("game_repo_path", repo)
+        orch.settings.set("game_repo_verified", True)
+
+        self._verify_worker("w1")
+        orch.queue.add(Task(id="task-9", title="Lifecycle test"))
+
+        # START, one tick: assign + auto handoff (worktree created).
+        self.app._run_btn.invoke()
+        self.root.update()
+        self.app.run_ctl.tick()
+        self.root.update()
+        slot = orch.workers.get("w1")
+        assert slot is not None
+        self.assertEqual(slot.state, WorkerState.WORKING.value)
+        self.assertTrue(slot.branch.startswith("bridge/w1/"))
+
+        # Simulate the worker's work: a change in its worktree.
+        ws_path = slot.workspace or repo
+        with open(os.path.join(ws_path, "feature.txt"), "w") as f:
+            f.write("worker did the thing\n")
+
+        # User confirms submit -> done.
+        self.app._w_submitted("w1")
+        self.root.update()
+        self.assertEqual(slot.state, WorkerState.WAITING_FOR_RESPONSE.value)
+        self.app._w_done("w1")
+        self.root.update()
+        self.assertEqual(slot.state, WorkerState.WAITING_FOR_USER.value)
+
+        # Transfer the completion report (bypass the paste dialog).
+        res = orch.submit_worker_report("w1", "<REPORT>did the thing</REPORT>")
+        self.assertTrue(res.ok, res.detail)
+        self.assertEqual(slot.state, WorkerState.REVIEW.value)
+
+        # Review packet builds against the real repo.
+        ok, packet = orch.prepare_review_packet("w1")
+        self.assertTrue(ok, packet)
+
+        # Integration gate: real merge into bridge/integration.
+        res = orch.integrate_worker("w1")
+        self.assertTrue(res.ok, res.detail)
+        self.assertEqual(orch.queue.get("task-9").status, "completed")
+        self.assertEqual(slot.state, WorkerState.READY.value)
+
+        # Queue drained, workers idle -> run stops itself.
+        events = self.app.run_ctl.tick()
+        self.root.update()
+        self.assertEqual(self.app.run_ctl.state, RunState.IDLE)
+        self.assertTrue(any("Run complete" in e for e in events),
+                        f"events: {events}")
+
+    def test_integrate_without_repo_fails_gracefully(self) -> None:
+        """No repo configured: integrate must fail gracefully, not crash."""
+        orch = self.app.orch
+        self._verify_worker("w1")
+        orch.queue.add(Task(id="task-8", title="No repo test"))
+        self.app._run_btn.invoke()
+        self.root.update()
+        self.app.run_ctl.tick()
+        self.root.update()
+        res = orch.submit_worker_report("w1", "report text")
+        self.assertTrue(res.ok, res.detail)
+        res = orch.integrate_worker("w1")
+        self.assertFalse(res.ok)
+        self.assertIn("repo", res.detail.lower())
 
 
 class TestGridLayout(unittest.TestCase):

@@ -251,6 +251,10 @@ class BridgeApp:
                             self._run_tick)
 
     def _refresh_run_bar(self) -> None:
+        # The bar may not exist yet (e.g. hotkey pressed during the
+        # first-run wizard) — never crash, just skip the visual update.
+        if not hasattr(self, "_run_dot"):
+            return
         st = self.run_ctl.state
         colors = {RunState.IDLE: "gray", RunState.RUNNING: "green",
                   RunState.STOPPING: "orange"}

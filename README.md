@@ -41,6 +41,34 @@ AWAITING_REPORT, REVIEW_PENDING, TASK_PASSED, TASK_FAILED, PAUSED, BLOCKED,
 STOPPED. State is saved after every handoff — close the app or restart
 Windows and it tells you exactly where you left off.
 
+## Run control (bot-client style)
+
+The run bar above the dashboard works like an old-school bot client:
+
+- **▶ START** — begins the run loop (every 5s): assigns eligible tasks to
+  verified idle workers, copies each handoff prompt to the clipboard, and
+  focuses that worker's window. You still paste the prompt and confirm
+  every step — the loop just never leaves a worker waiting.
+- **⏹ STOP** — graceful: finishes the current tick, then stands down.
+  Everything is persisted; in-flight handoffs keep their branches.
+- The loop **stops itself** when the queue is drained (or when remaining
+  tasks are all blocked and no workers are active — it tells you which).
+
+Global hotkeys (work even when the bridge window isn't focused):
+
+| Hotkey | Action |
+|---|---|
+| `Ctrl+Shift+S` | Start / Stop toggle |
+| `Ctrl+Shift+X` | Stop immediately |
+| `Ctrl+Shift+1`–`5` | Focus worker 1–5's window |
+
+**Tile windows** arranges all bound worker windows in a grid so you can
+watch the fleet at once.
+
+Deliberate boundary: hotkeys drive the bridge's own loop and window focus
+only — they never type into or click inside Muse/ChatGPT windows. Handoffs
+stay explicit clipboard copy/paste with your confirmation.
+
 ## Quick start (on your Windows PC)
 
 1. Install Python 3.10+ from https://www.python.org/downloads/

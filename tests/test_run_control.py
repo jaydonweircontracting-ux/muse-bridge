@@ -11,23 +11,51 @@ from muse_bridge import window_layout
 
 
 class FakeSlot:
-    def __init__(self, session_verified: bool):
+    def __init__(self, session_verified: bool, state: str = "READY"):
         self.session_verified = session_verified
+        self.state = state
 
 
 class FakeWorkers:
     def __init__(self, verified: int):
-        self.slots = [FakeSlot(True)] * verified
+        self.slots = [FakeSlot(True) for _ in range(verified)]
 
     def verified_count(self) -> int:
         return sum(1 for s in self.slots if s.session_verified)
 
 
+class FakeScheduler:
+    def __init__(self):
+        self.eligible: list = []
+
+    def eligible_tasks(self) -> list:
+        return self.eligible
+
+
+class FakeTask:
+    def __init__(self, status: str = "backlog"):
+        self.status = status
+
+
+class FakeQueue:
+    def __init__(self):
+        self.tasks: list = []
+
+
+class FakeHandoffResult:
+    def __init__(self, ok: bool, detail: str):
+        self.ok = ok
+        self.detail = detail
+
+
 class FakeOrchestrator:
     def __init__(self, verified: int = 0):
         self.workers = FakeWorkers(verified)
+        self.scheduler = FakeScheduler()
+        self.queue = FakeQueue()
         self.schedule_calls = 0
         self.shutdown_calls = 0
+        self.handoffs: list[str] = []
         self.fail_schedule = False
         self.next_report: dict = {"assigned": [], "blocked": []}
 
@@ -36,6 +64,12 @@ class FakeOrchestrator:
         if self.fail_schedule:
             raise RuntimeError("boom")
         return self.next_report
+
+    def prepare_worker_handoff(self, worker_id: str) -> FakeHandoffResult:
+        self.handoffs.append(worker_id)
+        for s in self.workers.slots:
+            s.state = "WORKING"
+        return FakeHandoffResult(True, "prompt copied; paste it in.")
 
     def safe_shutdown(self) -> None:
         self.shutdown_calls += 1
@@ -112,6 +146,58 @@ class TestRunController(unittest.TestCase):
         ok, _ = ctl.toggle()
         self.assertTrue(ok)
         self.assertEqual(ctl.state, RunState.STOPPING)
+
+    def test_tick_auto_prepares_handoff(self) -> None:
+        orch = FakeOrchestrator(verified=1)
+        orch.next_report = {"assigned": [("task-1", "w1")], "blocked": []}
+        ctl = RunController(orch=orch)
+        ctl.start()
+        events = ctl.tick()
+        self.assertEqual(orch.handoffs, ["w1"])
+        self.assertTrue(any("Handoff ready" in e for e in events),
+                        f"events: {events}")
+        # Worker now in flight -> run continues, no auto-stop.
+        self.assertEqual(ctl.state, RunState.RUNNING)
+
+    def test_auto_stop_when_queue_drained(self) -> None:
+        orch = FakeOrchestrator(verified=1)
+        orch.next_report = {"assigned": [], "blocked": []}
+        ctl = RunController(orch=orch)
+        ctl.start()
+        events = ctl.tick()
+        self.assertEqual(ctl.state, RunState.IDLE)
+        self.assertEqual(orch.shutdown_calls, 1)
+        self.assertTrue(any("Run complete" in e for e in events),
+                        f"events: {events}")
+
+    def test_no_auto_stop_while_worker_in_flight(self) -> None:
+        orch = FakeOrchestrator(verified=1)
+        orch.workers.slots[0].state = "WAITING_FOR_USER"
+        orch.next_report = {"assigned": [], "blocked": []}
+        ctl = RunController(orch=orch)
+        ctl.start()
+        ctl.tick()
+        self.assertEqual(ctl.state, RunState.RUNNING)
+
+    def test_no_auto_stop_while_tasks_eligible(self) -> None:
+        orch = FakeOrchestrator(verified=1)
+        orch.scheduler.eligible = ["task-9"]
+        orch.next_report = {"assigned": [], "blocked": []}
+        ctl = RunController(orch=orch)
+        ctl.start()
+        ctl.tick()
+        self.assertEqual(ctl.state, RunState.RUNNING)
+
+    def test_auto_stop_reports_deadlocked_tasks(self) -> None:
+        orch = FakeOrchestrator(verified=1)
+        orch.queue.tasks = [FakeTask("backlog")]
+        orch.next_report = {"assigned": [], "blocked": []}
+        ctl = RunController(orch=orch)
+        ctl.start()
+        events = ctl.tick()
+        self.assertEqual(ctl.state, RunState.IDLE)
+        self.assertTrue(any("blocked" in e.lower() for e in events),
+                        f"events: {events}")
 
 
 class TestHotkeys(unittest.TestCase):
