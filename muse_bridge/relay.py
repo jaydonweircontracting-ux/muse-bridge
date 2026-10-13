@@ -15,8 +15,9 @@ Safety rules (non-negotiable):
 - Any login wall, CAPTCHA, challenge, or ambiguity pauses the pair with
   a plain-English error. Nothing is retried blindly.
 - Automating ChatGPT's web UI is against OpenAI's terms for automated
-  access and may risk the user's account. The user explicitly accepted
-  this; the relay still pauses rather than pushing through blocks.
+  access and may risk the user's account. The relay is opt-in per pair
+  with an explicit consent prompt; it still pauses rather than pushing
+  through blocks.
 """
 from __future__ import annotations
 
@@ -33,6 +34,44 @@ from .ledger import (ACKNOWLEDGED, COPIED, DELIVERED, DETECTED, FAILED,
 
 def _hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+class ChallengeDetected(RuntimeError):
+    """A window agent found a login wall, CAPTCHA, rate-limit, or error
+    page. Part of the WindowAgent contract: the relay pauses the pair
+    instead of automating against the blocker."""
+
+
+def message_in_text(text: str, message: str) -> bool:
+    """Is our submitted message visible in the conversation text? Used
+    for the adopt-don't-resend check. Lives here (not uia_agent) so both
+    the orchestration and the agents share one implementation without a
+    circular import."""
+    marker = message.strip()
+    return bool(marker) and marker[:500] in text
+
+
+def _extract_delta(old: str, new: str) -> str:
+    """Identify the new tail of `new` relative to `old`.
+
+    Returns "" when nothing new is identifiable. Never returns the whole
+    conversation: if `old` isn't recognizable as a prefix (UI re-render,
+    reorder, cleared conversation), we refuse to guess rather than
+    relaying everything as the question.
+    """
+    if not old:
+        return new.strip()
+    if new.startswith(old):
+        return new[len(old):].strip()
+    old_lines = [ln.strip() for ln in old.splitlines()]
+    new_lines = [ln.strip() for ln in new.splitlines()]
+    i = 0
+    while (i < len(old_lines) and i < len(new_lines)
+           and old_lines[i] == new_lines[i]):
+        i += 1
+    if i == 0:
+        return ""
+    return "\n".join(new_lines[i:]).strip()
 
 
 class RelayState:
@@ -71,14 +110,25 @@ class WindowAgent:
         raise NotImplementedError
 
     def wait_for_response(self, timeout_s: float,
-                          baseline_hash: str) -> str | None:
+                          baseline_hash: str,
+                          submitted_text: str = "") -> str | None:
         """Return the COMPLETE new response text, or None on timeout /
-        ambiguity. Must never return a partial streaming response."""
+        ambiguity. Must never return a partial streaming response.
+        Raises ChallengeDetected on login walls / CAPTCHAs / errors."""
         raise NotImplementedError
 
     def conversation_id(self) -> str:
         """Current conversation URL/identifier, or '' if unreadable."""
         return ""
+
+    def stable_response_to(self, submitted_text: str,
+                           timeout_s: float = 10.0) -> str | None:
+        """Adopt path: the message was already submitted by an earlier
+        attempt and its response may already be sitting stable in the
+        conversation. Return the complete response if the window is
+        currently stable (no generating indicator, text unchanged for
+        the timeout); otherwise None. Default: unsupported."""
+        return None
 
 
 class FakeWindowAgent(WindowAgent):
@@ -106,7 +156,8 @@ class FakeWindowAgent(WindowAgent):
         return True
 
     def wait_for_response(self, timeout_s: float,
-                          baseline_hash: str) -> str | None:
+                          baseline_hash: str,
+                          submitted_text: str = "") -> str | None:
         return self.response
 
     def conversation_id(self) -> str:
@@ -129,6 +180,52 @@ class RelayController:
         self.pairs: dict[str, RelayPair] = {}
         self._busy = False
         self.events: list[str] = []
+        # Pair baselines survive restarts: without them, an in-flight
+        # message would silently become history after a crash instead of
+        # being retried (ledger NEEDS_REVIEW is the backstop).
+        from .store import data_dir
+        self.state_path = (directory or data_dir()) / "relay_pairs.json"
+        self._load_state()
+
+    # -- persistence ------------------------------------------------------
+    def _save_state(self) -> None:
+        try:
+            import json
+            raw = {wid: {"enabled": p.enabled, "state": p.state,
+                         "baselined": p.baselined,
+                         "last_muse_hash": p.last_muse_hash,
+                         "last_muse_text": p.last_muse_text[-4000:],
+                         "last_delivered_hash": p.last_delivered_hash,
+                         "error": p.error[:300]}
+                   for wid, p in self.pairs.items()}
+            tmp = self.state_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(raw, indent=1), encoding="utf-8")
+            tmp.replace(self.state_path)
+        except Exception:
+            pass
+
+    def _load_state(self) -> None:
+        try:
+            import json
+            raw = json.loads(self.state_path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        for wid, rec in raw.items():
+            p = self.pair_for(wid)
+            p.enabled = bool(rec.get("enabled"))
+            p.baselined = bool(rec.get("baselined"))
+            p.last_muse_hash = rec.get("last_muse_hash", "")
+            p.last_muse_text = rec.get("last_muse_text", "")
+            p.last_delivered_hash = rec.get("last_delivered_hash", "")
+            state = rec.get("state", RelayState.IDLE)
+            if state not in (RelayState.IDLE, RelayState.ERROR):
+                # Crashed mid-relay: the ledger entry is NEEDS_REVIEW;
+                # the pair waits for an explicit retry.
+                p.state = RelayState.ERROR
+                p.error = "bridge restarted mid-relay"
+            else:
+                p.state = state
+                p.error = rec.get("error", "")
 
     # -- pair management --------------------------------------------------
     def pair_for(self, worker_id: str) -> RelayPair:
@@ -146,6 +243,7 @@ class RelayController:
             p.state = RelayState.IDLE
             p.error = ""
         self._say(f"{worker_id} relay {'enabled' if enabled else 'disabled'}.")
+        self._save_state()
 
     def retry_pair(self, worker_id: str) -> str:
         """Re-arm a paused pair. The baseline is kept and failed polls
@@ -158,6 +256,7 @@ class RelayController:
         p.error = ""
         p.enabled = True
         self._say(f"{worker_id}: retry armed.")
+        self._save_state()
         return f"{worker_id}: retry armed"
 
     # -- polling ----------------------------------------------------------
@@ -175,22 +274,6 @@ class RelayController:
             out.append(self.poll_pair(wid))
         return out
 
-    def _new_content(self, pair: RelayPair, text: str) -> str:
-        h = _hash(text)
-        if h == pair.last_muse_hash:
-            return ""
-        old = pair.last_muse_text
-        pair.last_muse_hash = h
-        pair.last_muse_text = text
-        if old and text.startswith(old):
-            delta = text[len(old):].strip()
-        else:
-            delta = text.strip()
-        # Echo guard: never relay our own delivered response back.
-        if delta and _hash(delta) == pair.last_delivered_hash:
-            return ""
-        return delta
-
     def poll_pair(self, worker_id: str) -> str:
         pair = self.pair_for(worker_id)
         try:
@@ -199,6 +282,8 @@ class RelayController:
             return self._pause(pair, f"couldn't attach to Muse window: {e}")
         try:
             text = muse.read_text()
+        except ChallengeDetected as e:
+            return self._pause(pair, f"Muse window blocked ({e})")
         except Exception as e:
             return self._pause(pair, f"couldn't read Muse window: {e}")
         if not pair.baselined:
@@ -207,17 +292,36 @@ class RelayController:
             pair.baselined = True
             pair.last_muse_hash = _hash(text)
             pair.last_muse_text = text
+            self._save_state()
             return f"{worker_id}: baseline established"
         old_hash, old_text = pair.last_muse_hash, pair.last_muse_text
-        delta = self._new_content(pair, text)
-        if not delta:
+        new_hash = _hash(text)
+        if new_hash == old_hash:
             return f"{worker_id}: no new Muse content"
+        delta = _extract_delta(old_text, text)
+        # Echo guard: never relay our own delivered response back.
+        if delta and _hash(delta) == pair.last_delivered_hash:
+            delta = ""
+        if not delta:
+            # Content changed but nothing new is identifiable (UI
+            # re-render, reorder, cleared conversation). Never relay the
+            # whole conversation as a "question" — re-baseline and say
+            # so; the user can trigger a missed message with Relay now.
+            pair.last_muse_hash = new_hash
+            pair.last_muse_text = text
+            self._say(f"{worker_id}: Muse window changed in an "
+                      f"unrecognized way — re-baselined, nothing relayed.")
+            return f"{worker_id}: unrecognized change — re-baselined"
+        pair.last_muse_hash = new_hash
+        pair.last_muse_text = text
+        self._save_state()
         result = self._relay(worker_id, pair, delta)
         if pair.state == RelayState.ERROR:
             # Un-consume: a later retry (after the user fixes the issue)
             # must see this content as new again. The ledger entry is
             # NEEDS_REVIEW, so nothing is lost or duplicated.
             pair.last_muse_hash, pair.last_muse_text = old_hash, old_text
+            self._save_state()
         return result
 
     def _relay(self, worker_id: str, pair: RelayPair, message: str) -> str:
@@ -246,26 +350,54 @@ class RelayController:
 
     def _do_relay(self, worker_id: str, pair: RelayPair,
                   message: str) -> str:
-        chat = self.make_agent(worker_id, "chatgpt")
-        # Verify the destination conversation before sending.
         try:
-            url = chat.conversation_id()
+            chat = self.make_agent(worker_id, "chatgpt")
         except Exception as e:
             msg0 = self.ledger.create(worker_id, "", "relay", message)
             return self._fail(pair, msg0.id,
-                              f"couldn't verify ChatGPT conversation: {e}")
+                              f"couldn't attach to ChatGPT window: {e}")
+        try:
+            return self._do_relay_inner(worker_id, pair, message, chat)
+        except ChallengeDetected as e:
+            mid = (pair.pending_message_id
+                   or self.ledger.create(
+                       worker_id, "", "relay", message).id)
+            return self._fail(pair, mid, f"blocked page ({e}) — NOT sent")
+        except Exception as e:
+            mid = (pair.pending_message_id
+                   or self.ledger.create(
+                       worker_id, "", "relay", message).id)
+            return self._fail(pair, mid, f"relay error: {e}")
+
+    def _verify_conversation(self, chat: WindowAgent,
+                             worker_id: str) -> str:
+        """Return the verified URL or raise. A matching window title is
+        never sufficient proof of conversation identity."""
+        try:
+            url = chat.conversation_id()
+        except ChallengeDetected:
+            raise
+        except Exception as e:
+            raise RuntimeError(
+                f"couldn't verify ChatGPT conversation: {e}")
         expected = self._expected_url(worker_id)
-        if expected and url and url != expected:
-            msg0 = self.ledger.create(worker_id, "", "relay", message)
-            return self._fail(
-                pair, msg0.id,
+        if not expected:
+            raise RuntimeError(
+                "no expected conversation URL on file — re-map the "
+                "ChatGPT window so its URL is captured. NOT sent.")
+        if not url:
+            raise RuntimeError(
+                "couldn't read the ChatGPT conversation URL — refusing "
+                "to send to an unverified conversation. NOT sent.")
+        if url != expected:
+            raise RuntimeError(
                 f"ChatGPT window is on a different conversation "
                 f"(expected …{expected[-24:]}, found …{url[-24:]}). "
                 f"NOT sent.")
-        if not chat.focus():
-            msg0 = self.ledger.create(worker_id, "", "relay", message)
-            return self._fail(pair, msg0.id, "couldn't focus ChatGPT window")
+        return url
 
+    def _do_relay_inner(self, worker_id: str, pair: RelayPair,
+                        message: str, chat: WindowAgent) -> str:
         mh = _hash(message)
         prior = self._prior_submission(worker_id, mh, exclude="")
         if prior is not None:
@@ -278,36 +410,81 @@ class RelayController:
             msg = self.ledger.create(worker_id, "", "relay", message)
             self.ledger.transition(msg.id, QUEUED,
                                    "new Muse content detected")
-            self.ledger.transition(msg.id, COPIED, "ChatGPT window focused")
-            if not chat.type_and_submit(message):
-                return self._fail(pair, msg.id,
-                                  "typing into ChatGPT failed")
-            self.ledger.transition(msg.id, SUBMITTED, "message submitted")
         pair.pending_message_id = msg.id
+
+        # Verify the destination conversation BEFORE anything is typed.
+        self._verify_conversation(chat, worker_id)
+        if not chat.focus():
+            raise RuntimeError("couldn't focus ChatGPT window")
+        self.ledger.transition(msg.id, COPIED, "ChatGPT window focused")
+
+        if prior is None:
+            before = chat.read_text()
+            baseline_hash = _hash(before)
+            # Adopt, don't resend: an earlier attempt may have submitted
+            # while its verification was still uncertain.
+            adopted = message_in_text(before, message)
+            if adopted:
+                self._say(f"{worker_id}: message already present from an "
+                          f"earlier attempt — adopted, not resent.")
+            elif not chat.type_and_submit(message):
+                raise RuntimeError(
+                    "typing into ChatGPT failed (composer missing, "
+                    "disabled, or submit unverified)")
+            self.ledger.transition(msg.id, SUBMITTED, "message submitted")
+            self.ledger.set_relay_fields(
+                msg.id, submit_baseline_hash=baseline_hash)
+            submit_baseline = baseline_hash
+        else:
+            adopted = False
+            submit_baseline = (prior.submit_baseline_hash
+                               or _hash(chat.read_text()))
         pair.state = RelayState.WAIT_RESPONSE
 
-        baseline = _hash(chat.read_text())
-        response = chat.wait_for_response(self.response_timeout_s,
-                                          baseline)
+        # Fast paths: an earlier attempt may already hold the response.
+        response = prior.response_text if prior else ""
+        if not response and adopted:
+            # The message was submitted by the earlier attempt; its
+            # answer may already be sitting stable in the conversation.
+            # Confirm stability instead of waiting for new changes.
+            try:
+                response = chat.stable_response_to(message,
+                                                   timeout_s=10.0) or ""
+            except ChallengeDetected:
+                raise
+            except Exception:
+                response = ""
         if not response:
-            return self._fail(
-                pair, msg.id,
+            response = chat.wait_for_response(self.response_timeout_s,
+                                              submit_baseline, message)
+        if not response:
+            raise RuntimeError(
                 "no complete ChatGPT response within timeout — "
                 "paused; check the window yourself")
+        # The user could have switched conversations mid-wait: verify
+        # AGAIN before the response goes anywhere.
+        self._verify_conversation(chat, worker_id)
         self.ledger.transition(msg.id, RESPONSE_RECEIVED,
                                "complete response captured")
+        self.ledger.set_relay_fields(msg.id, response_text=response)
         pair.state = RelayState.TO_MUSE
 
         muse = self.make_agent(worker_id, "muse")
         if not muse.focus():
-            return self._fail(pair, msg.id,
-                              "couldn't refocus Muse window — response kept "
-                              "in ledger, nothing lost")
-        if not muse.type_and_submit(response):
-            return self._fail(pair, msg.id,
-                              "delivering to Muse failed — response kept "
-                              "in ledger, nothing lost")
-        pair.last_delivered_hash = _hash(response)
+            raise RuntimeError(
+                "couldn't refocus Muse window — response kept "
+                "in ledger, nothing lost")
+        muse_text = muse.read_text()
+        if response.strip() and response.strip() in muse_text:
+            # Crash between delivery and the ledger write, then retry:
+            # the response is already there — never retype it.
+            self._say(f"{worker_id}: response already present in the "
+                      f"Muse window — not retyped.")
+        elif not muse.type_and_submit(response):
+            raise RuntimeError(
+                "delivering to Muse failed — response kept "
+                "in ledger, nothing lost")
+        pair.last_delivered_hash = _hash(response.strip())
         # Don't re-relay our own delivery on the next poll.
         mt = muse.read_text()
         pair.last_muse_hash = _hash(mt)
@@ -318,6 +495,7 @@ class RelayController:
         pair.pending_message_id = ""
         self._say(f"{worker_id}: relayed {len(message)} chars -> "
                   f"{len(response)} chars back.")
+        self._save_state()
         return f"{worker_id}: relay complete"
 
     # -- helpers ----------------------------------------------------------
@@ -336,6 +514,7 @@ class RelayController:
         pair.state = RelayState.ERROR
         pair.error = reason
         self._say(f"{pair.worker_id} relay PAUSED: {reason}")
+        self._save_state()
         return f"{pair.worker_id}: PAUSED — {reason}"
 
     def recover(self) -> int:

@@ -37,7 +37,7 @@ TERMINAL = {ACKNOWLEDGED, FAILED}
 
 TRANSITIONS: dict[str, set[str]] = {
     DETECTED: {QUEUED, NEEDS_REVIEW, FAILED},
-    QUEUED: {COPIED, FAILED},
+    QUEUED: {COPIED, NEEDS_REVIEW, FAILED},
     COPIED: {SUBMITTED, NEEDS_REVIEW, FAILED},
     SUBMITTED: {RESPONSE_RECEIVED, NEEDS_REVIEW, FAILED},
     RESPONSE_RECEIVED: {DELIVERED, NEEDS_REVIEW, FAILED},
@@ -61,6 +61,9 @@ class Message:
     attempts: int = 0
     last_error: str = ""
     history: list[dict[str, Any]] = field(default_factory=list)
+    # Relay-only progress (crash-safe: persisted with the message).
+    response_text: str = ""          # complete response once received
+    submit_baseline_hash: str = ""   # chat text hash at submit time
 
     def __post_init__(self) -> None:
         if not self.id:
@@ -128,6 +131,23 @@ class MessageLedger:
             m.last_error = note if new_state in (FAILED, NEEDS_REVIEW) else ""
         m.history.append({"t": time.time(), "from": old,
                           "to": new_state, "note": note})
+        self._save()
+        return True
+
+    def set_relay_fields(self, msg_id: str,
+                         response_text: str | None = None,
+                         submit_baseline_hash: str | None = None) -> bool:
+        """Persist relay progress so a retry never resubmits or loses the
+        response after a crash. Returns False when the message is gone."""
+        m = self.messages.get(msg_id)
+        if not m:
+            return False
+        if response_text is not None:
+            m.response_text = response_text
+        if submit_baseline_hash is not None:
+            m.submit_baseline_hash = submit_baseline_hash
+        self._save()
+        return True
         self._save()
         return True
 

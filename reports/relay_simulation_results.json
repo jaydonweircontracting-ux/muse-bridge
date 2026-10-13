@@ -1,0 +1,156 @@
+{
+ "generated": "2026-10-13T10:42:45",
+ "starting_commit": "581121b",
+ "what_this_is": "SIMULATION results. These prove the control logic, NOT that pywinauto locators match the real ChatGPT/Muse DOM. See docs/RELAY_WINDOWS_INTEGRATION.md for the live gate.",
+ "deterministic_scenarios": {
+  "total": 21,
+  "passed": 21,
+  "scenarios": [
+   {
+    "id": "SIM-A-01",
+    "ok": true,
+    "problems": [],
+    "ms": 6.5
+   },
+   {
+    "id": "SIM-A-02",
+    "ok": true,
+    "problems": [],
+    "ms": 4.1
+   },
+   {
+    "id": "SIM-A-03",
+    "ok": true,
+    "problems": [],
+    "ms": 1.4
+   },
+   {
+    "id": "SIM-A-04",
+    "ok": true,
+    "problems": [],
+    "ms": 0.8
+   },
+   {
+    "id": "SIM-A-05",
+    "ok": true,
+    "problems": [],
+    "ms": 1.8
+   },
+   {
+    "id": "SIM-B-01",
+    "ok": true,
+    "problems": [],
+    "ms": 0.8
+   },
+   {
+    "id": "SIM-B-02",
+    "ok": true,
+    "problems": [],
+    "ms": 0.7
+   },
+   {
+    "id": "SIM-B-03",
+    "ok": true,
+    "problems": [],
+    "ms": 1.4
+   },
+   {
+    "id": "SIM-C-01",
+    "ok": true,
+    "problems": [],
+    "ms": 0.9
+   },
+   {
+    "id": "SIM-C-02",
+    "ok": true,
+    "problems": [],
+    "ms": 3.9
+   },
+   {
+    "id": "SIM-C-03",
+    "ok": true,
+    "problems": [],
+    "ms": 8.3
+   },
+   {
+    "id": "SIM-D-01",
+    "ok": true,
+    "problems": [],
+    "ms": 8.6
+   },
+   {
+    "id": "SIM-D-02",
+    "ok": true,
+    "problems": [],
+    "ms": 2.2
+   },
+   {
+    "id": "SIM-D-03",
+    "ok": true,
+    "problems": [],
+    "ms": 1.5
+   },
+   {
+    "id": "SIM-D-04",
+    "ok": true,
+    "problems": [],
+    "ms": 1.6
+   },
+   {
+    "id": "SIM-E-01",
+    "ok": true,
+    "problems": [],
+    "ms": 2.6
+   },
+   {
+    "id": "SIM-E-02",
+    "ok": true,
+    "problems": [],
+    "ms": 2.3
+   },
+   {
+    "id": "SIM-E-03",
+    "ok": true,
+    "problems": [],
+    "ms": 1.7
+   },
+   {
+    "id": "SIM-F-01",
+    "ok": true,
+    "problems": [],
+    "ms": 0.9
+   },
+   {
+    "id": "SIM-F-01b",
+    "ok": true,
+    "problems": [],
+    "ms": 0.3
+   },
+   {
+    "id": "SIM-F-03",
+    "ok": true,
+    "problems": [],
+    "ms": 1.4
+   }
+  ]
+ },
+ "fault_injection": {
+  "runs": 1000,
+  "passed": 1000,
+  "failures": [],
+  "ms": 4332.2,
+  "invariants": [
+   "INV1 no wrong-conversation submission",
+   "INV2 no partial delivered as complete",
+   "INV3 no cross-pair delivery",
+   "INV4 challenge/identity faults pause safely",
+   "INV5 no duplicate submissions"
+  ]
+ },
+ "e2e_cycles": {
+  "cycles": 100,
+  "completed": 100,
+  "pairs": 2,
+  "ms": 3254.8
+ }
+}

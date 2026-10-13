@@ -25,9 +25,20 @@ class Agents:
 
 
 def make_controller(agents: Agents, **kw):
-    led = MessageLedger(tmpdir())
-    ctl = RelayController(led, agents, **kw)
-    ctl.get_worker = lambda wid: None  # no URL expectations
+    tmp = tmpdir()
+    led = MessageLedger(tmp)
+    ctl = RelayController(led, agents, directory=tmp, **kw)
+
+    class Slot:
+        def __init__(self, url: str):
+            self.chatgpt_url = url
+
+    # Default: the fake ChatGPT window's own URL is the expected one.
+    def get_worker(wid: str):
+        agent = agents.map.get((wid, "chatgpt"))
+        url = agent.url if agent else ""
+        return Slot(url)
+    ctl.get_worker = get_worker
     return ctl
 
 
@@ -65,7 +76,7 @@ class TestRelayRoundTrip(unittest.TestCase):
     def test_no_new_content_is_idle(self) -> None:
         agents = Agents()
         agents.set("w1", "muse", FakeWindowAgent(text="hello"))
-        agents.set("w1", "chatgpt", FakeWindowAgent(text="hi"))
+        agents.set("w1", "chatgpt", FakeWindowAgent(text="hi", url="https://chat.openai.com/c/1"))
         ctl = make_controller(agents, poll_interval_s=0)
         ctl.set_enabled("w1", True)
         ctl.poll_pair("w1")  # baseline
@@ -78,7 +89,7 @@ class TestRelayRoundTrip(unittest.TestCase):
         muse = FakeWindowAgent(text="history")
         agents.set("w1", "muse", muse)
         agents.set("w1", "chatgpt",
-                   FakeWindowAgent(text="x", response="ChatGPT: a."))
+                   FakeWindowAgent(text="x", url="https://chat.openai.com/c/1", response="ChatGPT: a."))
         ctl = make_controller(agents, poll_interval_s=0)
         ctl.set_enabled("w1", True)
         ctl.poll_pair("w1")  # baseline
@@ -98,10 +109,10 @@ class TestRelayIsolation(unittest.TestCase):
         m2 = FakeWindowAgent(text="Muse2 history")
         agents.set("w1", "muse", m1)
         agents.set("w1", "chatgpt",
-                   FakeWindowAgent(text="", response="ChatGPT: alpha answer"))
+                   FakeWindowAgent(text="", url="https://chat.openai.com/c/a", response="ChatGPT: alpha answer"))
         agents.set("w2", "muse", m2)
         agents.set("w2", "chatgpt",
-                   FakeWindowAgent(text="", response="ChatGPT: beta answer"))
+                   FakeWindowAgent(text="", url="https://chat.openai.com/c/b", response="ChatGPT: beta answer"))
         ctl = make_controller(agents, poll_interval_s=0)
         ctl.set_enabled("w1", True)
         ctl.set_enabled("w2", True)
@@ -163,7 +174,7 @@ class TestRelayFailures(unittest.TestCase):
         agents = Agents()
         muse = FakeWindowAgent(text="history")
         agents.set("w1", "muse", muse)
-        chat = FakeWindowAgent(text="x", response=None)
+        chat = FakeWindowAgent(text="x", url="https://chat.openai.com/c/1", response=None)
         agents.set("w1", "chatgpt", chat)
         ctl = make_controller(agents, poll_interval_s=0,
                               response_timeout_s=0.01)

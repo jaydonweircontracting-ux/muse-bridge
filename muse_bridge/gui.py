@@ -861,6 +861,30 @@ class BridgeApp:
                     f"conversation.\n\nMove it to {slot.label} anyway?"):
                 return
         self.orch.workers.map_chatgpt(wid, title)
+        # Capture the conversation URL now, while the window is open: the
+        # relay's conversation-identity check depends on it. Best effort —
+        # mapping still works when the URL can't be read here.
+        url = ""
+        if title:
+            try:
+                from . import uia_agent
+                slot2 = self.orch.workers.get(wid)
+                handle = slot2.chatgpt_handle if slot2 else 0
+                if handle:
+                    agent = uia_agent.agent_for(handle, "chatgpt")
+                    url = agent.conversation_id()
+            except Exception:
+                url = ""
+            if url:
+                self.orch.workers.map_chatgpt(wid, title, url=url)
+                self.log.append("app", f"{wid} ChatGPT conversation URL "
+                                       f"captured (…{url[-24:]}).")
+            else:
+                self.log.append("app", f"{wid} ChatGPT mapped, but the "
+                                       f"conversation URL couldn't be read — "
+                                       f"the relay will refuse to send until "
+                                       f"a URL is on file. Re-map while the "
+                                       f"conversation is open.")
         self.log.append("app", f"{wid} ChatGPT -> '{title[:50]}'"
                                if title else f"{wid} ChatGPT mapping cleared.")
         self._refresh_workers()

@@ -257,19 +257,24 @@ shuttles messages automatically — no API, no copy/paste after setup:
    pauses/resumes.
 5. **Relay now** triggers one pair immediately.
 
-Safety rules: one pair relays at a time (no focus fights); responses
+Safety rules: one pair at a time (no focus fights); responses
 must be stable and complete before delivery (a streaming pause doesn't
-count); the bridge's own deliveries are never re-relayed (echo guard);
+count — the completion watcher requires the generating indicator to
+vanish plus a quiet interval, or a long documented settle period);
+the bridge's own deliveries are never re-relayed (echo guard);
 retries never resend an already-submitted message (ledger content-hash
-check); any ambiguity, login wall, CAPTCHA, or timeout pauses only
-that pair with a plain-English error and NEEDS_REVIEW — never blind
-retries. Every step is recorded in the message ledger.
+check + adopt-don't-resend); the conversation URL is verified before
+sending AND after the wait; any ambiguity, login wall, CAPTCHA, or
+timeout pauses only that pair with a plain-English error and
+NEEDS_REVIEW — never blind retries. Every step is recorded in the
+message ledger, and pair baselines survive restarts.
 
-Honest limits: the UIA window agents (`uia_agent.py`) are UNVERIFIED —
-they were written without access to a Windows ChatGPT/Muse session and
-must be confirmed on your PC before the relay is trusted. ChatGPT/Muse
-UI changes can break control detection; the relay fails safe (pauses)
-rather than clicking blindly.
+Verification status: the control logic is proven by the simulation lab
+(`tests/sim_lab/`, `docs/RELAY_SIMULATION_GUIDE.md`) — 21 scenarios,
+1000 fault-injection runs, 100 e2e cycles, zero wrong-conversation
+submissions. The pywinauto DOM locators still need your PC:
+`python -m muse_bridge.relay_windows_check --live --pairs 2`
+(see `docs/RELAY_WINDOWS_INTEGRATION.md`).
 
 ## Verification status
 
