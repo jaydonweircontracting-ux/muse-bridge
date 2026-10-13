@@ -11,10 +11,12 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 from pathlib import Path
 
 from . import git_ops, muse_link
-from .chatgpt import ChatGPTApi, ManualRelay
+from .chatgpt import ChatGPTApi, ManualRelay, UsageLedger, DEFAULT_MODEL, PRICE_TABLE, PRICES_AS_OF
 from .runner import Runner
 from .state import ResponseState
 from .store import Brief, Checkpoints, EventLog, Settings, Task, TaskQueue
+from .project_state import ProjectState
+import time
 
 
 class BridgeApp:
@@ -27,8 +29,14 @@ class BridgeApp:
         self.queue = TaskQueue()
         self.checkpoints = Checkpoints()
         self.brief = Brief()
+        self.project_state = ProjectState()
+        self.ledger = UsageLedger(self.settings.dir / "usage.jsonl")
+        self.session_start = time.time()
         self.runner = Runner(self.settings, self.log, self.queue,
-                             self.checkpoints, self.brief)
+                             self.checkpoints, self.brief,
+                             project_state=self.project_state,
+                             ledger=self.ledger,
+                             session_start=self.session_start)
         self.manual = ManualRelay()
         self._stop_flag = False
         self._wire_integrations()
@@ -41,8 +49,7 @@ class BridgeApp:
     def _wire_integrations(self) -> None:
         mode = self.settings.get("chatgpt_mode", "api")
         if mode == "api":
-            api = ChatGPTApi(self.settings.get("openai_api_key", ""),
-                             self.settings.get("openai_model", "gpt-4o-mini"))
+            api = self._make_api()
             self.runner.plan_task = lambda t: self._api_plan(api, t)
             self.runner.review = lambda ev: self._api_review(api, ev)
         else:
@@ -52,25 +59,54 @@ class BridgeApp:
         self.runner.wait_muse_done = self._wait_muse_done
         self.runner.verify_checks = self._verify_checks
 
+    def _make_api(self) -> ChatGPTApi:
+        return ChatGPTApi(
+            self.settings.get("openai_api_key", ""),
+            self.settings.get("openai_model", DEFAULT_MODEL),
+            ledger=self.ledger,
+            price_overrides=self.settings.get("price_overrides", {}))
+
     def _api_plan(self, api: ChatGPTApi, task: Task) -> tuple[str, str]:
+        state = self.project_state.summary_prompt_block()
         r = api.complete(
-            f"Define short, testable acceptance criteria for this game-dev task.\n"
+            f"{state}\n\nDefine short, testable acceptance criteria for this game-dev task.\n"
             f"Task: {task.title}\n{task.brief}\nReply with 3-6 bullet criteria only.",
-            system="You are a strict QA planner for a 2.5D isometric RPG codebase.",
-            max_tokens=400)
+            instructions="You are a strict QA planner for a 2.5D isometric RPG codebase.",
+            max_output_tokens=400, purpose="plan")
         return (r.text if r.ok else task.acceptance, "chatgpt-api" if r.ok else r.error)
 
     def _api_review(self, api: ChatGPTApi, evidence: str) -> tuple[bool, str]:
         r = api.complete(
-            f"Review this development evidence. Reply 'APPROVE' or 'REJECT' first, then reasons.\n\n{evidence[:3000]}",
-            system="You are a strict code reviewer. Approve only if tests/build pass, the diff is clean, and the acceptance criteria are met by the evidence.",
-            max_tokens=400)
+            f"Review this development evidence. Reply 'APPROVE' or 'REJECT' first, then reasons.\n\n{evidence[:3000]}\n\n"
+            + ProjectState.update_instruction(),
+            instructions="You are a strict code reviewer. Approve only if tests/build pass, the diff is clean, and the acceptance criteria are met by the evidence.",
+            max_output_tokens=600, purpose="review")
         if not r.ok:
             return False, f"Reviewer error: {r.error}"
+        summary = ProjectState.extract_summary(r.text)
+        if summary:
+            self.project_state.save_summary(summary)
+            self.log.append("state", "Project-state summary updated by reviewer.")
         txt = r.text.strip()
         return txt.upper().startswith("APPROVE"), txt[:300]
 
     def _send_to_muse(self, text: str) -> bool:
+        """Level 1: Muse Code CLI. Level 2: window paste (fallback)."""
+        mode = self.settings.get("muse_mode", "cli")
+        repo = self.runner.repo()
+        if mode == "cli" and repo is not None:
+            cli = muse_link.MuseCodeCli(
+                self.settings.get("muse_cli_template", ""))
+            res = cli.run_task(text, str(repo),
+                               timeout_s=int(self.settings.get("task_time_limit_s", 3600)))
+            self.log.append("muse-cli",
+                            f"exit={res.exit_code} timed_out={res.timed_out} "
+                            f"stdout={len(res.stdout)} chars")
+            # Stash completion + report where the runner's wait step finds it.
+            self._cli_done = res.ok and not res.timed_out
+            self._last_cli_report = res.stdout
+            return self._cli_done
+        # Fallback: window automation.
         title = self.settings.get("muse_window_title", "")
         if not title or not muse_link.focus_window(title):
             self.log.append("muse", "Could not focus Muse window.")
@@ -85,6 +121,12 @@ class BridgeApp:
         return ok
 
     def _wait_muse_done(self) -> str:
+        # CLI mode: run_task already blocked until exit; completion known
+        # from the exit code — reliable, unlike the window heuristic.
+        if getattr(self, "_cli_done", None) is not None:
+            done = self._cli_done
+            del self._cli_done
+            return "complete" if done else "timeout"
         watch = muse_link.CompletionWatch(
             quiet_s=25.0, poll_s=2.0)
         timeout = float(self.settings.get("response_timeout_s", 600))
@@ -114,18 +156,29 @@ class BridgeApp:
         ttk.Button(row, text="Browse…", command=self._browse_repo).pack(side="left", padx=6)
         self._repo_status = ttk.Label(f, text=""); self._repo_status.pack(anchor="w")
 
-        # 2. Muse window
-        ttk.Label(f, text="2. Muse window").pack(anchor="w", pady=(10, 0))
+        # 2. Muse integration
+        ttk.Label(f, text="2. Muse — the developer").pack(anchor="w", pady=(10, 0))
+        self._muse_mode = tk.StringVar(value=self.settings.get("muse_mode", "cli"))
+        ttk.Radiobutton(f, text="Muse Code CLI (recommended — reliable completion via exit code)",
+                        variable=self._muse_mode, value="cli").pack(anchor="w")
+        ttk.Radiobutton(f, text="Muse app window (fallback — completion detection is UNCERTAIN)",
+                        variable=self._muse_mode, value="window").pack(anchor="w")
+        row_cli = ttk.Frame(f); row_cli.pack(fill="x", pady=4)
+        ttk.Button(row_cli, text="Probe Muse CLI…", command=self._probe_cli).pack(side="left")
+        self._cli_status = ttk.Label(row_cli, text="")
+        self._cli_status.pack(side="left", padx=6)
         row2 = ttk.Frame(f); row2.pack(fill="x", pady=4)
+        ttk.Label(row2, text="Window title (fallback):").pack(side="left")
         self._muse_var = tk.StringVar(value=self.settings.get("muse_window_title", ""))
-        ttk.Entry(row2, textvariable=self._muse_var, width=60).pack(side="left")
-        ttk.Button(row2, text="Detect windows…", command=self._detect_windows).pack(side="left", padx=6)
+        ttk.Entry(row2, textvariable=self._muse_var, width=40).pack(side="left", padx=6)
+        ttk.Button(row2, text="Detect windows…", command=self._detect_windows).pack(side="left")
         caps = muse_link.capabilities()
-        ttk.Label(f, text=f"Muse completion detection: {caps.completion_detection.upper()} — {caps.detail}",
-                  wraplength=800, foreground="orange" if caps.completion_detection != "api" else "green").pack(anchor="w")
+        ttk.Label(f, text=f"Muse: {caps.detail}", wraplength=800,
+                  foreground="green" if caps.completion_detection == "cli-exit-code"
+                  else "orange").pack(anchor="w")
 
-        # 3. ChatGPT
-        ttk.Label(f, text="3. ChatGPT connection").pack(anchor="w", pady=(10, 0))
+        # 3. ChatGPT — planning & review brain (official Responses API)
+        ttk.Label(f, text="3. ChatGPT connection (official OpenAI API — billed separately from ChatGPT Plus)").pack(anchor="w", pady=(10, 0))
         self._gpt_mode = tk.StringVar(value=self.settings.get("chatgpt_mode", "api"))
         ttk.Radiobutton(f, text="Official OpenAI API (automatic)", variable=self._gpt_mode,
                         value="api").pack(anchor="w")
@@ -134,9 +187,20 @@ class BridgeApp:
         row3 = ttk.Frame(f); row3.pack(fill="x", pady=4)
         ttk.Label(row3, text="API key:").pack(side="left")
         self._key_var = tk.StringVar(value=self.settings.get("openai_api_key", ""))
-        ttk.Entry(row3, textvariable=self._key_var, width=50, show="•").pack(side="left", padx=6)
+        ttk.Entry(row3, textvariable=self._key_var, width=40, show="•").pack(side="left", padx=6)
         ttk.Button(row3, text="Test", command=self._test_api).pack(side="left")
         self._api_status = ttk.Label(f, text=""); self._api_status.pack(anchor="w")
+        row3b = ttk.Frame(f); row3b.pack(fill="x", pady=4)
+        ttk.Label(row3b, text="Model:").pack(side="left")
+        self._model_var = tk.StringVar(value=self.settings.get("openai_model", DEFAULT_MODEL))
+        ttk.Combobox(row3b, textvariable=self._model_var,
+                     values=sorted(PRICE_TABLE), width=18,
+                     state="readonly").pack(side="left", padx=6)
+        ttk.Label(row3b, text="Spend limit (USD/session):").pack(side="left", padx=(12, 0))
+        self._spend_var = tk.StringVar(value=str(self.settings.get("spend_limit_usd", 5.0)))
+        ttk.Entry(row3b, textvariable=self._spend_var, width=8).pack(side="left", padx=6)
+        ttk.Label(f, text=f"Prices are estimates ({PRICES_AS_OF}).",
+                  wraplength=800, foreground="gray").pack(anchor="w")
 
         # 4. Brief
         ttk.Label(f, text="4. Paste your ONE starter prompt (project brief)").pack(anchor="w", pady=(10, 0))
@@ -183,8 +247,25 @@ class BridgeApp:
                 text=msg, foreground="green" if r.ok else "red"))
         threading.Thread(target=run, daemon=True).start()
 
+    def _probe_cli(self) -> None:
+        probe = muse_link.MuseCodeCli().probe()
+        color = "green" if probe.found else "red"
+        self._cli_status.config(text=(probe.detail[:100]), foreground=color)
+        if probe.found:
+            self.settings.set("muse_mode", "cli")
+            self._muse_mode.set("cli")
+        messagebox.showinfo("Muse CLI probe", probe.detail)
+
     def _wizard_finish(self) -> None:
         self.settings.set("chatgpt_mode", self._gpt_mode.get())
+        self.settings.set("openai_model", self._model_var.get())
+        try:
+            self.settings.set("spend_limit_usd", float(self._spend_var.get()))
+        except ValueError:
+            pass
+        self.settings.set("muse_mode", self._muse_mode.get())
+        if self._muse_var.get().strip():
+            self.settings.set("muse_window_title", self._muse_var.get().strip())
         if self._key_var.get().strip():
             self.settings.set("openai_api_key", self._key_var.get().strip())
         txt = self._brief_text.get("1.0", "end").strip()
@@ -213,7 +294,8 @@ class BridgeApp:
 
         info = ttk.Frame(self.root, padding=10); info.pack(fill="x")
         self._info_vars: dict[str, tk.StringVar] = {}
-        for key in ["Active task", "Queue", "Last checkpoint", "Cycles ok/failed", "Muse link", "ChatGPT"]:
+        for key in ["Active task", "Queue", "Last checkpoint", "Cycles ok/failed",
+                    "Muse link", "ChatGPT", "API spend (session)"]:
             ttk.Label(info, text=key + ":").grid(sticky="w", padx=4)
             v = tk.StringVar(value="—")
             self._info_vars[key] = v
@@ -243,9 +325,17 @@ class BridgeApp:
             self._info_vars["Queue"].set(str(counts))
             self._info_vars["Last checkpoint"].set(cp["commit"] if cp else "none")
             self._info_vars["Cycles ok/failed"].set(f"{self.runner.cycles_ok}/{self.runner.cycles_failed}")
+            muse_mode = self.settings.get("muse_mode", "cli")
+            caps = muse_link.capabilities()
             self._info_vars["Muse link"].set(
-                f"{self.settings.get('muse_window_title', '—')} [{self.settings.get('muse_completion_mode')}]")
-            self._info_vars["ChatGPT"].set(self.settings.get("chatgpt_mode", "api"))
+                f"{muse_mode} [{caps.completion_detection}]")
+            self._info_vars["ChatGPT"].set(
+                f"{self.settings.get('chatgpt_mode', 'api')} / {self.settings.get('openai_model', DEFAULT_MODEL)}")
+            spend = self.ledger.session_totals(self.session_start)
+            limit = float(self.settings.get("spend_limit_usd", 0) or 0)
+            self._info_vars["API spend (session)"].set(
+                f"${spend['cost_usd']:.4f} / ${limit:.2f} limit "
+                f"({int(spend['input_tokens'])} in / {int(spend['output_tokens'])} out)")
             self._log_view.config(state="normal")
             self._log_view.delete("1.0", "end")
             for rec in self.log.tail(60):

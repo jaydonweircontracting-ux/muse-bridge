@@ -12,6 +12,10 @@ from muse_bridge.state import ResponseState, StateTracker
 from muse_bridge.store import EventLog, Settings, Task, TaskQueue, Checkpoints
 from muse_bridge.runner import Runner
 from muse_bridge.store import Brief
+from muse_bridge.chatgpt import (_extract_text, estimate_cost, UsageLedger,
+                                 DEFAULT_MODEL)
+from muse_bridge.project_state import ProjectState
+from muse_bridge import muse_link
 
 
 def tmpdir() -> Path:
@@ -108,6 +112,112 @@ class TestRunnerSafety(unittest.TestCase):
         s = r.handoff_summary()
         self.assertIn("State:", s)
         self.assertIn("Tasks:", s)
+
+
+class TestResponsesApi(unittest.TestCase):
+    def test_extract_output_text_field(self) -> None:
+        data = {"status": "completed", "output_text": "hello world",
+                "usage": {"input_tokens": 5, "output_tokens": 2}}
+        self.assertEqual(_extract_text(data), "hello world")
+
+    def test_extract_from_output_items(self) -> None:
+        data = {"status": "completed", "output": [
+            {"type": "reasoning", "summary": []},
+            {"type": "message", "content": [
+                {"type": "output_text", "text": "APPROVE"},
+                {"type": "output_text", "text": " — looks good"},
+            ]},
+        ]}
+        self.assertEqual(_extract_text(data), "APPROVE — looks good")
+
+    def test_extract_empty(self) -> None:
+        self.assertEqual(_extract_text({"status": "completed"}), "")
+
+    def test_cost_estimation(self) -> None:
+        # 1M in + 1M out of gpt-4o-mini at (0.15, 0.60) = $0.75
+        self.assertAlmostEqual(
+            estimate_cost("gpt-4o-mini", 1_000_000, 1_000_000), 0.75)
+        # Unknown model falls back to default rates, never crashes.
+        self.assertGreaterEqual(estimate_cost("nope-9", 10, 10), 0.0)
+
+    def test_usage_ledger(self) -> None:
+        d = tmpdir()
+        ledger = UsageLedger(d / "usage.jsonl")
+        ledger.record(DEFAULT_MODEL, 100, 50, 0.0001, "plan")
+        totals = ledger.totals()
+        self.assertEqual(totals["calls"], 1)
+        self.assertEqual(totals["input_tokens"], 100)
+        self.assertAlmostEqual(totals["cost_usd"], 0.0001)
+        # Persists across instances.
+        ledger2 = UsageLedger(d / "usage.jsonl")
+        self.assertEqual(ledger2.totals()["calls"], 1)
+
+
+class TestProjectState(unittest.TestCase):
+    def test_roundtrip(self) -> None:
+        ps = ProjectState(tmpdir())
+        self.assertEqual(ps.load()["summary"], "")
+        ps.save_summary("Towns render; combat untested.")
+        self.assertIn("Towns render", ps.load()["summary"])
+        self.assertIn("Towns render", ps.summary_prompt_block())
+
+    def test_extract_summary_tags(self) -> None:
+        text = "APPROVE\n<STATE_SUMMARY>All green. Next: audio.</STATE_SUMMARY>\nbye"
+        self.assertEqual(ProjectState.extract_summary(text),
+                         "All green. Next: audio.")
+        self.assertEqual(ProjectState.extract_summary("no tags"), "")
+
+
+class TestSpendLimit(unittest.TestCase):
+    def _runner(self, d: Path) -> Runner:
+        s = Settings(d)
+        ledger = UsageLedger(d / "usage.jsonl")
+        return Runner(s, EventLog(d), TaskQueue(d), Checkpoints(d), Brief(d),
+                      ledger=ledger)
+
+    def test_no_limit_no_block(self) -> None:
+        d = tmpdir()
+        r = self._runner(d)
+        r.settings.set("spend_limit_usd", 0)
+        ok, _ = r.spend_ok()
+        self.assertTrue(ok)
+
+    def test_limit_enforced(self) -> None:
+        d = tmpdir()
+        r = self._runner(d)
+        r.settings.set("spend_limit_usd", 0.01)
+        assert r.ledger is not None
+        r.ledger.record(DEFAULT_MODEL, 1_000_000, 1_000_000, 0.75, "plan")
+        ok, msg = r.spend_ok()
+        self.assertFalse(ok)
+        self.assertIn("Spend limit", msg)
+        # A cycle must refuse to start when over budget.
+        r.queue.add(Task(id="t1", title="x"))
+        res = r.run_one_cycle()
+        self.assertIsNotNone(res)
+        assert res is not None
+        self.assertFalse(res.success)
+
+
+class TestMuseCli(unittest.TestCase):
+    def test_probe_reports_gracefully_when_missing(self) -> None:
+        # Must never crash; reports found=False with install guidance.
+        probe = muse_link.MuseCodeCli().probe()
+        self.assertIsInstance(probe.found, bool)
+        if not probe.found:
+            self.assertIn("muse", probe.detail)
+
+    def test_run_task_fails_cleanly_without_binary(self) -> None:
+        import shutil
+        if shutil.which("muse"):
+            self.skipTest("muse CLI present; manual test needed")
+        res = muse_link.MuseCodeCli().run_task("hi", "/tmp", timeout_s=5)
+        self.assertFalse(res.ok)
+
+    def test_capabilities_never_claims_unverified(self) -> None:
+        caps = muse_link.capabilities()
+        self.assertIn(caps.completion_detection,
+                      ("cli-exit-code", "uncertain", "unavailable"))
 
 
 if __name__ == "__main__":

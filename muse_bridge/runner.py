@@ -25,6 +25,8 @@ from typing import Callable, Optional
 
 from .state import ResponseState, StateTracker
 from .store import Checkpoints, EventLog, Settings, Task, TaskQueue, Brief
+from .project_state import ProjectState
+from .chatgpt import UsageLedger
 from . import git_ops
 
 
@@ -42,12 +44,18 @@ ShouldStop = Callable[[], bool]
 class Runner:
     def __init__(self, settings: Settings, log: EventLog,
                  queue: TaskQueue, checkpoints: Checkpoints,
-                 brief: Brief) -> None:
+                 brief: Brief,
+                 project_state: ProjectState | None = None,
+                 ledger: UsageLedger | None = None,
+                 session_start: float | None = None) -> None:
         self.settings = settings
         self.log = log
         self.queue = queue
         self.checkpoints = checkpoints
         self.brief = brief
+        self.project_state = project_state
+        self.ledger = ledger
+        self.session_start = session_start or time.time()
         self.tracker = StateTracker(
             response_timeout_s=float(settings.get("response_timeout_s", 600)),
             max_retries=int(settings.get("max_retries", 3)),
@@ -77,10 +85,27 @@ class Runner:
             return Path(p)
         return None
 
+    def spend_ok(self) -> tuple[bool, str]:
+        """Enforce the user's spending limit before starting work."""
+        limit = float(self.settings.get("spend_limit_usd", 0) or 0)
+        if limit <= 0 or self.ledger is None:
+            return True, "no limit set"
+        spent = self.ledger.session_totals(self.session_start)["cost_usd"]
+        if spent >= limit:
+            return False, (f"Spend limit reached: ${spent:.4f} >= "
+                           f"${limit:.2f}. Raise it in Settings or wait.")
+        return True, f"${spent:.4f} of ${limit:.2f} used"
+
     def run_one_cycle(self, should_stop: ShouldStop = lambda: False) -> CycleResult | None:
         if self.tracker.busy():
             self.log.append("runner", "Refusing to start: a task is already in flight.")
             return None
+        ok, spend_msg = self.spend_ok()
+        if not ok:
+            self.log.append("runner", f"Cycle refused: {spend_msg}")
+            self.tracker.transition(ResponseState.BLOCKED, "spend limit")
+            self.tracker.transition(ResponseState.READY, "spend limit noted")
+            return CycleResult("", False, spend_msg)
         task = self.queue.active() or self.queue.next_backlog()
         if task is None:
             self.log.append("runner", "Backlog empty; nothing to do.")
@@ -201,8 +226,11 @@ class Runner:
 
     def _build_prompt(self, task: Task) -> str:
         brief = self.brief.load()
+        state_block = (self.project_state.summary_prompt_block()
+                       if self.project_state else "")
         return (
             f"Project brief:\n{brief.get('text', '')[:4000]}\n\n"
+            f"{state_block}\n\n"
             f"Task {task.id}: {task.title}\n{task.brief}\n\n"
             f"Acceptance criteria:\n{task.acceptance}\n\n"
             "Rules: preserve existing architecture; verify with tests and a "

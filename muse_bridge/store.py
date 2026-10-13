@@ -65,6 +65,12 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "pause_after_failure": True,
     "require_approval_for_risky": True,
     "first_run_complete": False,
+    # ChatGPT / spending (OpenAI API is billed separately from ChatGPT Plus)
+    "spend_limit_usd": 5.00,
+    "price_overrides": {},
+    # Muse integration: "cli" preferred, "window" fallback
+    "muse_mode": "cli",
+    "muse_cli_template": "",
 }
 
 
