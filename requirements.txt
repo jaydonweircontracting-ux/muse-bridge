@@ -1,0 +1,5 @@
+# Windows-only runtime dependencies.
+# Core app uses the standard library only; these enable the Muse window link.
+pyinstaller>=6.0
+pywinauto>=0.6.8
+pyautogui>=0.9.54
