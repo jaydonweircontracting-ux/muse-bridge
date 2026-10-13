@@ -64,6 +64,8 @@ muse_bridge/
   runner.py              Headless single-handoff coordinator (unit-tested)
   orchestrator.py        Multi-worker engine: schedule, handoff, integrate
   workers.py             5 worker slots; verified sessions only, never simulated
+  accounts.py            Multi-account manager (BUILD 2); no secrets stored
+  browser_profiles.py    Isolated browser profiles per account (BUILD 2)
   workspaces.py          Git worktree isolation per worker (branch fallback)
   ownership.py           File ownership registry + conflict detection
   scheduler.py           Dependency-aware assignment, honest concurrency limit
@@ -73,13 +75,45 @@ muse_bridge/
   muse_link.py           Window listing + focus (pywinauto); no scraping, no guessing
   chatgpt.py             Manual-relay coordination (no API in this edition)
   git_ops.py             Safe git reads, diff scan, local test/build runner
-  gui.py                 Tkinter wizard + control panel (Handoffs + Workers tabs)
-tests/test_core.py       19 unit tests (python -m unittest discover -s tests)
+  gui.py                 Tkinter wizard + control panel (Handoffs + Workers + Accounts tabs)
+tests/test_core.py       19 unit tests
 tests/test_orchestration.py  14 orchestration tests
+tests/test_accounts.py   11 account-manager tests
 scripts/acceptance_walkthrough.py      25-check handoff cycle (25/25 pass)
 scripts/acceptance_orchestration.py    19-check multi-worker cycle (19/19 pass)
 build_windows.bat        The single packaging step (run on Windows)
 ```
+
+## Multi-account access (Accounts tab)
+
+Each Facebook account (or Instagram/email/phone-backed Meta account — per
+Meta's sign-in options) gets its own **isolated browser profile**, so
+sessions cannot leak into each other:
+
+1. **ADD ACCOUNT** — label it (e.g. "Personal FB").
+2. **Open login** — launches Chrome/Edge with that account's private profile
+   at muse.ai. Sign in through Meta's normal login flow yourself.
+3. **Mark signed in** — confirm muse.ai loads in that window.
+4. **Bind to slot** — link the account to a worker slot (w1–w5).
+5. On the **Workers tab**: bind the slot's Muse window, then **Verify
+   session** with the probe prompt. Only verified sessions count toward
+   the concurrency limit.
+
+The bridge never stores passwords, tokens, or cookies — only labels,
+statuses, and profile paths. Disconnecting or removing one account never
+touches the others.
+
+**Verified platform facts (Oct 2026):** Muse signs in with a Meta account,
+which can be backed by Facebook, Instagram, email, or phone — so separate
+Facebook accounts can back separate Muse logins. There is currently no
+native Windows Muse app (Microsoft announced one is coming); on Windows,
+Muse runs at muse.ai in the browser, which is exactly why isolated
+browser profiles are the supported session-separation method.
+
+**Not yet verified from here:** the real Facebook→Meta→Muse login flow on
+your PC (no Windows/browser here). The account manager is explicit about
+what it can and cannot detect — follow the on-screen steps and it will
+tell you what needs your confirmation.
 
 ## Multi-worker orchestration (Workers tab)
 
@@ -110,13 +144,16 @@ Up to five Muse workers collaborate on the **same** Adventure Game V2 repo:
 
 ## Verification status
 
-- 33/33 unit tests pass (handoff engine + orchestration engine).
+- 44/44 unit tests pass (handoff engine + orchestration engine + accounts).
 - 25/25 handoff acceptance checks pass: full plan→dev→verify→review→
   checkpoint cycle plus close/reopen recovery, against a fixture repo.
 - 19/19 orchestration acceptance checks pass: two concurrent tasks in
   separate worktrees, conflict blocking, evidence-based integration,
   failed-test merge block with worker branch preserved, restart recovery,
   honest 2/5 concurrency reporting.
+- Account manager: all logic tested (binding rules, isolation, no-secret
+  storage). The real Facebook→Meta→Muse login flow is NOT testable from
+  this Linux environment — it is verified on your PC via the Accounts tab.
 - The Windows EXE itself is **not yet built** — this environment is Linux and
   PyInstaller only builds for its host OS. Run `build_windows.bat` on a
   Windows PC for the one remaining packaging step, then use the wizard's

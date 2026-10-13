@@ -192,10 +192,13 @@ class BridgeApp:
         nb.pack(fill="both", expand=True)
         hf = ttk.Frame(nb)
         wf = ttk.Frame(nb)
+        af = ttk.Frame(nb)
         nb.add(hf, text="Handoffs")
         nb.add(wf, text="Workers (1–5)")
+        nb.add(af, text="Accounts")
         self._build_handoff_tab(hf)
         self._build_workers_tab(wf)
+        self._build_accounts_tab(af)
         # Restart recovery: tell the user what was happening.
         st = self.coord.tracker.state
         if st not in (HandoffState.READY, HandoffState.STOPPED):
@@ -443,9 +446,11 @@ class BridgeApp:
             idle_s = "never" if idle < 0 else f"{int(idle)}s ago"
             waiting = "  *** WAITING FOR YOU ***" if row["waiting_for_user"] else ""
             files = ", ".join(row["files"][:4]) + ("…" if len(row["files"]) > 4 else "")
+            acct = row.get("account_label", "")
+            acct_s = f"  account={acct} ({row.get('account_status','')})" if acct else "  account=—"
             self._worker_rows[wid]["info"].set(
                 f"[{row['connection']}] state={row['state']}  task={row['task'] or '—'}  "
-                f"branch={row['branch'] or '—'}{waiting}\n"
+                f"branch={row['branch'] or '—'}{acct_s}{waiting}\n"
                 f"files: {files or '—'}   last test: {row['last_test'] or '—'}   "
                 f"errors={row['errors']} retries={row['retries']}   last activity: {idle_s}"
                 + (f"   note: {row['note']}" if row["note"] else ""))
@@ -462,6 +467,165 @@ class BridgeApp:
                     self._gate_view.insert("end", f"{rec['kind']}: {rec['message']}\n")
             self._gate_view.config(state="disabled")
             self._gate_view.see("end")
+
+    # -- accounts tab --------------------------------------------------------------
+    def _build_accounts_tab(self, parent) -> None:
+        top = ttk.Frame(parent, padding=10); top.pack(fill="x")
+        ttk.Label(top, text="Muse accounts",
+                  font=("TkDefaultFont", 12, "bold")).pack(side="left")
+        self._acc_summary_lbl = ttk.Label(top, text="")
+        self._acc_summary_lbl.pack(side="left", padx=16)
+        ttk.Button(top, text="ADD ACCOUNT",
+                   command=self._acc_add).pack(side="left", padx=4)
+        ttk.Label(parent, wraplength=920, padding=(10, 2),
+                  text="Each account opens in its own isolated browser profile, so logins "
+                       "cannot leak into each other. You sign in through Meta's normal "
+                       "login flow — the bridge never sees or stores passwords. "
+                       "Then bind the account to a worker slot and verify its Muse "
+                       "session on the Workers tab.").pack(fill="x")
+        ttk.Label(parent, wraplength=920, padding=(10, 0), foreground="gray",
+                  text="Note: the bridge cannot detect your login by itself. "
+                       "After signing in, press 'Mark signed in'.").pack(fill="x")
+
+        self._acc_rows_frame = ttk.Frame(parent, padding=6)
+        self._acc_rows_frame.pack(fill="both", expand=True)
+        self._acc_row_vars: dict[str, dict] = {}
+
+    def _acc_add(self) -> None:
+        label = _ask_text(self.root, "Add account",
+                          "Label for this account (e.g. 'Personal FB', 'Alt FB 2'):\n"
+                          "(one line)")
+        if label is None:
+            return
+        label = label.strip().splitlines()[0] if label.strip() else ""
+        if not label:
+            messagebox.showinfo("Add account", "A label is required.")
+            return
+        acc = self.orch.accounts.add(label, provider="facebook")
+        self.log.append("accounts", f"Added account '{label}' ({acc.id}).")
+        self._refresh_accounts()
+
+    def _acc_open_login(self, acc_id: str) -> None:
+        from . import browser_profiles
+        acc = self.orch.accounts.get(acc_id)
+        if not acc:
+            return
+        ok, msg = browser_profiles.launch_profile(acc.profile_dir)
+        self.log.append("accounts", f"Open login for '{acc.label}': {msg}")
+        if ok:
+            messagebox.showinfo(
+                "Sign in",
+                f"A browser window opened with an isolated profile for '{acc.label}'.\n\n"
+                "1. Go through Meta's normal login (Facebook/Instagram/email).\n"
+                "2. Open muse.ai in that same window and confirm Muse loads.\n"
+                "3. Come back here and press 'Mark signed in'.")
+        else:
+            messagebox.showinfo("Open login", msg)
+
+    def _acc_mark_signed_in(self, acc_id: str) -> None:
+        acc = self.orch.accounts.get(acc_id)
+        if not acc:
+            return
+        if messagebox.askyesno("Confirm",
+                               f"Have you signed into '{acc.label}' in its browser window\n"
+                               "and confirmed muse.ai loads there?"):
+            self.orch.accounts.set_status(acc_id, "signed_in")
+            self.log.append("accounts", f"'{acc.label}' marked signed in (user-confirmed).")
+        self._refresh_accounts()
+
+    def _acc_bind(self, acc_id: str) -> None:
+        acc = self.orch.accounts.get(acc_id)
+        if not acc:
+            return
+        slots = self.orch.workers.slots
+        names = "\n".join(f"{i+1}. {s.id} — {s.label} ({s.role})"
+                          for i, s in enumerate(slots))
+        choice = _ask_choice(self.root, "Bind to worker slot",
+                             f"Bind '{acc.label}' to which worker slot?\n\n{names}\n\nType the number:",
+                             len(slots))
+        if choice is None:
+            return
+        ok, msg = self.orch.bind_account_to_slot(acc_id, slots[choice].id)
+        self.log.append("accounts", msg)
+        messagebox.showinfo("Bind", msg + ("\n\nNext: on the Workers tab, bind the "
+                                           "Muse window for that slot and Verify session."))
+        self._refresh_accounts()
+        self._refresh_workers()
+
+    def _acc_unbind(self, acc_id: str) -> None:
+        ok, msg = self.orch.unbind_account_from_slot(acc_id)
+        self.log.append("accounts", msg)
+        self._refresh_accounts()
+        self._refresh_workers()
+
+    def _acc_disconnect(self, acc_id: str) -> None:
+        acc = self.orch.accounts.get(acc_id)
+        if not acc:
+            return
+        # Disconnecting one account never touches the others.
+        if acc.worker_slot:
+            self.orch.workers.disconnect(acc.worker_slot)
+        self.orch.accounts.set_status(acc_id, "disconnected",
+                                      "user disconnected; others unaffected")
+        self.log.append("accounts", f"'{acc.label}' disconnected.")
+        self._refresh_accounts()
+        self._refresh_workers()
+
+    def _acc_reconnect(self, acc_id: str) -> None:
+        self._acc_open_login(acc_id)
+        self.orch.accounts.set_status(acc_id, "added",
+                                      "re-login launched; mark signed in when done")
+
+    def _acc_remove(self, acc_id: str) -> None:
+        acc = self.orch.accounts.get(acc_id)
+        if not acc:
+            return
+        if not messagebox.askyesno("Remove account",
+                                   f"Remove '{acc.label}'?\n\nThis unlinks it from any worker slot. "
+                                   "Other accounts are not affected."):
+            return
+        if acc.worker_slot:
+            self.orch.unbind_account_from_slot(acc_id)
+            self.orch.workers.unlink_account(acc.worker_slot)
+        keep = messagebox.askyesno("Browser profile",
+                                   "Also delete its isolated browser profile?")
+        self.orch.accounts.remove(acc_id, delete_profile=keep)
+        self.log.append("accounts", f"'{acc.label}' removed.")
+        self._refresh_accounts()
+        self._refresh_workers()
+
+    def _refresh_accounts(self) -> None:
+        if not hasattr(self, "_acc_rows_frame"):
+            return
+        for w in self._acc_rows_frame.winfo_children():
+            w.destroy()
+        summary = self.orch.accounts.summary()
+        self._acc_summary_lbl.config(
+            text=f"{summary['total']} account(s) — "
+                 + ", ".join(f"{k}: {v}" for k, v in summary["by_status"].items()))
+        for acc in self.orch.accounts.accounts:
+            fr = ttk.LabelFrame(self._acc_rows_frame,
+                                text=f"{acc.label}  [{acc.provider}]",
+                                padding=6)
+            fr.pack(fill="x", padx=6, pady=3)
+            status_line = (f"status={acc.status}   "
+                           f"slot={acc.worker_slot or '—'}")
+            if acc.note:
+                status_line += f"   note: {acc.note}"
+            ttk.Label(fr, text=status_line, wraplength=880).pack(anchor="w")
+            btns = ttk.Frame(fr); btns.pack(anchor="w", pady=2)
+            aid = acc.id
+            for label, cmd in [
+                ("Open login", lambda a=aid: self._acc_open_login(a)),
+                ("Mark signed in", lambda a=aid: self._acc_mark_signed_in(a)),
+                ("Bind to slot", lambda a=aid: self._acc_bind(a)),
+                ("Unbind", lambda a=aid: self._acc_unbind(a)),
+                ("Disconnect", lambda a=aid: self._acc_disconnect(a)),
+                ("Reconnect", lambda a=aid: self._acc_reconnect(a)),
+                ("Remove", lambda a=aid: self._acc_remove(a)),
+            ]:
+                ttk.Button(btns, text=label, command=cmd, width=14).pack(
+                    side="left", padx=2)
 
     # -- dashboard actions -------------------------------------------------------
     def _say(self, res: StepResult) -> None:
@@ -604,6 +768,7 @@ class BridgeApp:
         try:
             self._refresh()
             self._refresh_workers()
+            self._refresh_accounts()
         finally:
             if self.root.winfo_exists():
                 self.root.after(2000, self._tick)

@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Callable
 
 from . import git_ops
+from .accounts import AccountManager
 from .handoff import build_dev_prompt, extract_tagged, new_id
 from .integrate import IntegrationGate
 from .ownership import OwnershipRegistry
@@ -47,6 +48,7 @@ class Orchestrator:
         self.profile = ProjectProfile(d)
         self.workers = WorkerManager(d)
         self.ownership = OwnershipRegistry(d)
+        self.accounts = AccountManager(d)
         self.scheduler = Scheduler(self.queue, self.workers, self.ownership)
         self._worktrees: WorktreeManager | None = None
 
@@ -222,13 +224,44 @@ class Orchestrator:
 
     # -- dashboard ---------------------------------------------------------------
     def dashboard(self) -> dict:
-        return {
+        dash = {
             "verified_sessions": self.workers.verified_count(),
             "concurrency_limit": self.workers.concurrency_limit(),
             "workers": self.workers.status_rows(),
             "queue": self.queue.counts(),
             "ownership": self.ownership.summary(),
+            "accounts": self.accounts.summary(),
         }
+        # Attach account labels to worker rows for the dashboard.
+        for row in dash["workers"]:
+            acc = self.accounts.account_for_slot(row["id"])
+            row["account_label"] = acc.label if acc else ""
+            row["account_status"] = acc.status if acc else ""
+        return dash
+
+    def bind_account_to_slot(self, account_id: str,
+                             worker_id: str) -> tuple[bool, str]:
+        """Link an account to a worker slot (both directions)."""
+        ok, msg = self.accounts.bind_worker(account_id, worker_id)
+        if not ok:
+            return False, msg
+        self.workers.link_account(worker_id, account_id)
+        # Also carry the window title if the slot already has one bound;
+        # otherwise the user binds the window on the Workers tab.
+        self.log.append("accounts",
+                        f"Account {account_id} linked to slot {worker_id}.")
+        return True, msg
+
+    def unbind_account_from_slot(self, account_id: str) -> tuple[bool, str]:
+        acc = self.accounts.get(account_id)
+        if not acc:
+            return False, "Unknown account."
+        if acc.worker_slot:
+            self.workers.unlink_account(acc.worker_slot)
+        self.accounts.unbind_worker(account_id)
+        self.log.append("accounts",
+                        f"Account {account_id} unlinked from its slot.")
+        return True, "Unlinked."
 
     def safe_shutdown(self) -> None:
         """Persist everything; workers keep their branches/work."""

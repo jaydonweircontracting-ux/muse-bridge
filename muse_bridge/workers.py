@@ -61,6 +61,7 @@ class WorkerSlot:
     label: str                   # "Muse 1" (user-editable)
     role: str                    # configurable role
     window_title: str = ""       # bound Muse window/session
+    account_id: str = ""         # linked account (BUILD 2)
     state: str = WorkerState.OFFLINE.value
     session_verified: bool = False
     verified_at: float = 0.0
@@ -226,6 +227,7 @@ class WorkerManager:
             age = now - s.last_activity if s.last_activity else -1
             rows.append({
                 "id": s.id, "label": s.label, "role": s.role,
+                "account_id": s.account_id,
                 "connection": ("verified" if s.session_verified
                                else ("bound" if s.window_title else "offline")),
                 "state": s.state, "task": s.task_id,
@@ -237,3 +239,19 @@ class WorkerManager:
                 "idle_for_s": age, "note": s.note,
             })
         return rows
+
+    def link_account(self, worker_id: str, account_id: str) -> bool:
+        s = self.get(worker_id)
+        if not s:
+            return False
+        s.account_id = account_id
+        self.save()
+        return True
+
+    def unlink_account(self, worker_id: str) -> bool:
+        s = self.get(worker_id)
+        if not s:
+            return False
+        s.account_id = ""
+        self.save()
+        return True

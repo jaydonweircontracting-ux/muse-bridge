@@ -18,12 +18,27 @@
 ## Step 2 — One-time setup
 1. **ChatGPT window:** click Detect, pick your ChatGPT browser window, then
    Test focus to prove the bridge can bring it forward.
-2. **Muse window:** same — Detect, pick, Test focus.
-3. **Game folder:** Browse to your Adventure Game V2 folder. The bridge
+2. **Game folder:** Browse to your Adventure Game V2 folder. The bridge
    verifies it's a git repo and reads its real details (React/Vite,
    scripts, detected systems) into your project profile.
-4. **Master prompt:** paste your one big RPG instruction. The bridge saves it
+3. **Master prompt:** paste your one big RPG instruction. The bridge saves it
    — you never paste it again.
+
+## Step 2b — Add your Muse accounts (Accounts tab)
+1. Open the **Accounts** tab → **ADD ACCOUNT** → label it (e.g. "Personal FB").
+2. **Open login** — a browser window opens with a private, isolated profile.
+   Sign in through Meta's normal login (Facebook/Instagram/email), then open
+   muse.ai in that same window and check Muse loads.
+3. **Mark signed in** — confirm it yourself; the bridge can't detect logins.
+4. **Bind to slot** — link the account to a worker slot (w1–w5).
+5. Repeat for each Facebook account you want as a worker.
+6. On the **Workers tab**: for each slot, **Bind window** (pick its Muse
+   window), then **Verify session** (paste the probe prompt into that
+   session, paste its reply back). Only verified sessions receive tasks.
+
+Tip: one account = one worker slot in practice. The bridge counts verified
+*sessions*, so if you genuinely have two independent Muse windows verified,
+you get two workers — never more than what's real.
 
 ## Step 3 — The daily routine
 1. Open `MuseBridge.exe`.
